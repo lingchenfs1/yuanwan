@@ -108,11 +108,19 @@ stop_fakegw() {
 trap stop_fakegw EXIT
 
 echo "== 1. 密钥和配对（工作目录 ${WORK}）" >&2
-"$CLIENT" keygen >/dev/null
-CPUB="$("$CLIENT" pubkey)"
-"$FAKEGW" keygen --keys "$KEYS"
-"$FAKEGW" pair add e2e "$CPUB" --keys "$KEYS" --entry "127.0.0.1:${PORT}" --stdout \
-    | "$CLIENT" pair import --name local >&2
+# 配对这一步的输出（含 pair add、pair import 的提示）都进 pair.log，和其他日志一起做脱敏检查，不直接给调用方
+PAIRLOG="${WORK}/pair.log"
+if ! {
+    "$CLIENT" keygen >>"$PAIRLOG" 2>&1 &&
+        CPUB="$("$CLIENT" pubkey 2>>"$PAIRLOG")" &&
+        "$FAKEGW" keygen --keys "$KEYS" >>"$PAIRLOG" 2>&1 &&
+        "$FAKEGW" pair add e2e "$CPUB" --keys "$KEYS" --entry "127.0.0.1:${PORT}" --stdout 2>>"$PAIRLOG" \
+        | "$CLIENT" pair import --name local >>"$PAIRLOG" 2>&1
+}; then
+    echo "密钥或配对失败，明细见 ${PAIRLOG}" >&2
+    exit 1
+fi
+grep -h '^已导入网关' "$PAIRLOG" >&2 || true
 
 echo "== 2. 起 fakegw：127.0.0.1:${PORT}" >&2
 "$FAKEGW" --keys "$KEYS" --listen "127.0.0.1:${PORT}" --file "$CLIP" --loop --stop-file "$STOPF" \
@@ -185,7 +193,17 @@ PAT="${WORK}/.secrets"
     } | tr -d ' \r' | grep -E '^[0-9A-Fa-f]{64}$' >"$PAT"
 )
 nsec="$(wc -l <"$PAT" | tr -d ' ')"
-LOGS=("${WORK}/fakegw.out" "${WORK}/fakegw.log" "${WORK}/headless.out" "${WORK}/headless.log" "${WORK}/connect.out")
+# 配对串形式：前缀 ywp1-，以及 PSK 在配对串里的 base64url 片段。配对串主体是 base64url(网关公钥 32 B‖PSK 32 B‖…)，
+# PSK 的第 1~30 字节从第 33 字节起、正好在 3 字节边界上，编码后和配对串主体第 44~83 个字符逐字相同
+(
+    umask 077
+    echo 'ywp1-' >>"$PAT"
+    awk '!/^#/ && NF >= 3 { print $3 }' "${KEYS}/clients" | while read -r hex; do
+        printf '%s' "$hex" | cut -c3-62 | xxd -r -p | base64 | tr '+/' '-_' | tr -d '=\n'
+        echo
+    done >>"$PAT"
+)
+LOGS=("${PAIRLOG}" "${WORK}/fakegw.out" "${WORK}/fakegw.log" "${WORK}/headless.out" "${WORK}/headless.log" "${WORK}/connect.out")
 for f in "${WORK}/connect/"*; do
     LOGS+=("$f")
 done
@@ -198,7 +216,7 @@ elif [ -n "$leaks" ]; then
     printf '  %s\n' "$leaks" >&2
     pass=0
 else
-    echo "脱敏检查通过：${#LOGS[@]} 个日志文件里没有私钥、reset_key、PSK" >&2
+    echo "脱敏检查通过：${#LOGS[@]} 个日志文件里没有私钥、reset_key、PSK，也没有配对串" >&2
 fi
 
 if [ "$pass" = 1 ]; then

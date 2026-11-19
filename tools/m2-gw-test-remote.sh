@@ -202,3 +202,21 @@ for d in "${DIR_M1}" "${DIR}"; do
 done
 echo "== 日志里不应出现配对串（期望每个文件都是 0）"
 grep -c 'ywp1-' "${DIR}/stderr.log" "${DIR}/gateway.jsonl" "${DIR_M1}/stderr.log" "${DIR_M1}/gateway.jsonl" 2>/dev/null | sed 's/^/  /'
+echo "== 日志里不应出现私钥、reset_key、PSK 的十六进制（只打印命中的文件名，不打印密钥）"
+PAT="$(umask 077; mktemp "${DIR}/.secrets.XXXXXX")"
+{
+	grep -v '^#' "${DIR}/keys/gateway.key" 2>/dev/null
+	grep -v '^#' "${DIR}/keys/reset.key" 2>/dev/null
+	awk '!/^#/ && NF >= 3 { print $3 }' "${DIR}/keys/clients" 2>/dev/null
+} | tr -d ' \r' | grep -E '^[0-9A-Fa-f]{64}$' >"$PAT" || true
+nsec="$(wc -l <"$PAT" | tr -d ' ')"
+leaks="$(grep -l -i -F -f "$PAT" "${DIR}/stderr.log" "${DIR}/gateway.jsonl" "${DIR_M1}/stderr.log" "${DIR_M1}/gateway.jsonl" 2>/dev/null || true)"
+rm -f "$PAT"
+if [ "$nsec" -lt 3 ]; then
+	echo "  只取到 ${nsec} 个密钥（应 ≥ 3 个），检查不完整"
+elif [ -n "$leaks" ]; then
+	echo "  不通过：以下日志里出现了密钥或 PSK："
+	printf '    %s\n' $leaks
+else
+	echo "  通过：${nsec} 个密钥都没出现在日志里"
+fi

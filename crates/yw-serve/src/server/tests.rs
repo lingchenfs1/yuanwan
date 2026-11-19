@@ -737,5 +737,34 @@ fn spawned_server_over_loopback() {
     }
     assert!(ev.contains(&CEv::Closed(close_code::GATEWAY_EXIT)));
     assert!(!h.status().running);
+
+    // 服务线程退出之后：push 失败但清掉 client_present（视频回调据此照 M1 返回 true），不算队列满
+    let t2 = Instant::now();
+    while !h.join.is_finished() && t2.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!h.is_running());
+    let full_before = h.status().counters.media_full;
+    assert!(!h.push(MediaMsg::Video { seq: seq + 1, epoch: EPOCH, data: key_au(), frames_lost: 0, recovered: false, rx_us: 0 }));
+    assert!(!h.client_present());
+    assert_eq!(h.status().counters.media_full, full_before);
     sink.assert_no_secrets();
+}
+
+#[test]
+fn thread_panic_clears_client_present_and_logs() {
+    let shared = Arc::new(ServeShared::default());
+    shared.client_present.store(true, Relaxed);
+    shared.status.lock().unwrap().running = true;
+    let sink = Arc::new(Sink::default());
+    let guard = ExitGuard { shared: shared.clone(), log: sink.clone() };
+    let j = std::thread::spawn(move || {
+        let _guard = guard;
+        panic!("测试：模拟服务线程 panic");
+    });
+    assert!(j.join().is_err());
+    assert!(!shared.client_present.load(Relaxed));
+    assert!(shared.stopped.load(Relaxed));
+    assert!(!shared.status.lock().unwrap().running);
+    assert!(sink.0.lock().unwrap().iter().any(|l| l.starts_with("E ywp")), "panic 要记 E 级日志");
 }

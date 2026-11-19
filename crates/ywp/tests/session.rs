@@ -677,19 +677,212 @@ fn removed_client_is_dropped_with_close4() {
 }
 
 #[test]
-fn silent_client_removed_after_60s() {
+fn silent_client_removed_after_60s_without_close_and_recovers() {
     let mut w = World::new(TakeoverPolicy::RequireFlag, 1, ideal(), 18);
     w.connect(0);
     w.run_until(ms(300));
-    // 上行断了（下行还通）：网关 60 s 收不到任何包就删会话，并给客户端发 CLOSE(4)
+    let cid = w.cls[0].conn.cid();
+    // 上行断 65 s（下行还通）：网关 60 s 收不到任何包就删会话，但不发 CLOSE（发了客户端会永久停下）
     let t0 = w.now;
-    w.cls[0].up.add_outage(t0, t0 + secs(120));
-    w.run_for(secs(65));
+    w.cls[0].up.add_outage(t0, t0 + secs(65));
+    w.run_for(secs(62));
     let (t, _) = w.gw_ev.iter().find(|(_, e)| *e == GEv::Closed(close_code::GATEWAY_ENDED)).expect("应当删会话");
     assert!((t0 + secs(59)..=t0 + secs(61)).contains(t), "删会话于 {} µs", t - t0);
     assert!(w.gw.conn().is_none());
-    // 下行一直通，客户端没有 30 s 静默；它收到 CLOSE(4) 后停下
-    assert_eq!(w.count_c(0, |e| *e == CEv::Closed(close_code::GATEWAY_ENDED)), 1);
+    assert_eq!(w.count_c(0, |e| matches!(e, CEv::Closed(_))), 0, "60 s 静默删会话不应给客户端发 CLOSE");
+    // 上行恢复：客户端的包换回 RESET，带 resume 重新握手
+    w.run_for(secs(5));
+    assert!(w.count_c(0, |e| *e == CEv::Reset) >= 1, "上行恢复后应当收到 RESET");
+    assert!(w.cls[0].conn.is_established(), "上行恢复后应当重新建立");
+    assert_ne!(w.cls[0].conn.cid(), cid);
+    let resume = w.gw_ev.iter().rev().find_map(|(_, e)| if let GEv::Connected { resume, .. } = e { Some(*resume) } else { None });
+    assert_eq!(resume, Some(Some((HOST_ID, EPOCH))));
+}
+
+#[test]
+fn client_silence_30s_rehandshakes() {
+    let mut w = World::new(TakeoverPolicy::RequireFlag, 1, ideal(), 31);
+    w.connect(0);
+    w.run_until(ms(300));
+    assert!(w.cls[0].conn.is_established());
+    let cid = w.cls[0].conn.cid();
+    let inits0 = w.cls[0].hs_inits;
+    let t0 = w.now;
+    // 下行断 40 s（上行照通，网关会话不删）：客户端 30 s 没收到任何包，应当放弃旧密钥重握
+    w.cls[0].down.add_outage(t0, t0 + secs(40));
+    w.run_for(secs(29));
+    assert_eq!(w.cls[0].hs_inits, inits0, "29 s 时还不该重握");
+    w.run_for(secs(2));
+    assert!(w.cls[0].hs_inits > inits0, "31 s 时应当已经重握");
+    w.run_for(secs(15));
+    assert!(w.cls[0].conn.is_established(), "下行恢复后应当重新建立");
+    assert_ne!(w.cls[0].conn.cid(), cid);
+}
+
+#[test]
+fn first_data_no_reply_1s_rehandshakes() {
+    let mut w = World::new(TakeoverPolicy::RequireFlag, 1, ideal(), 32);
+    // 上行只放行 HS_INIT，DATA 全丢 1.5 s
+    w.cls[0].up.set_filter(Some(Box::new(|p: &Vec<u8>, at: Micros| at < ms(1500) && p[0] != 0x48)));
+    w.connect(0);
+    w.run_until(ms(900));
+    assert!(!w.cls[0].conn.is_established());
+    let inits0 = w.cls[0].hs_inits;
+    w.run_until(ms(1100));
+    assert!(w.cls[0].hs_inits > inits0, "第一个 DATA 之后 1 s 没回音应当重握");
+    w.run_until(secs(4));
+    assert!(w.cls[0].conn.is_established());
+}
+
+#[test]
+fn close5_then_new_gateway_reconnects() {
+    let mut w = World::new(TakeoverPolicy::RequireFlag, 1, ideal(), 34);
+    w.connect(0);
+    w.run_until(ms(300));
+    assert!(w.cls[0].conn.is_established());
+    let me = ClientId::of(&client_kp(0).public());
+    let t0 = w.now;
+    // 网关进程退出（CLOSE(5)），之后 8 s 不收包，然后新进程起来（状态全空）
+    w.cls[0].up.add_outage(t0, t0 + secs(8));
+    w.gw.kick(&me, close_code::GATEWAY_EXIT);
+    w.run_for(ms(50));
+    assert_eq!(w.count_c(0, |e| *e == CEv::Closed(close_code::GATEWAY_EXIT)), 1);
+    w.gw = Gateway::new(gw_cfg(TakeoverPolicy::RequireFlag));
+    w.run_until(t0 + secs(8));
+    assert!(!w.cls[0].conn.is_established());
+    let inits = w.cls[0].hs_inits;
+    w.run_for(secs(3));
+    assert!(w.cls[0].hs_inits > inits, "客户端应当一直按节奏重握");
+    assert!(w.cls[0].conn.is_established(), "新网关起来后 3 s 内应当连上");
+}
+
+/// 空闲一段时间后再关闭：三份 CLOSE 仍按第一份真正发出的时刻 +5、+10 ms 发，不能背靠背（规格 §5.5.8）
+#[test]
+fn close_copies_spaced_even_after_idle() {
+    let mut buf = [0u8; BASE_PAYLOAD];
+    // 客户端：40 ms 没调用端点，再 close
+    let mut w = World::new(TakeoverPolicy::RequireFlag, 1, ideal(), 35);
+    w.connect(0);
+    w.run_until(ms(300));
+    assert!(w.cls[0].conn.is_established());
+    let t0 = w.now + ms(40);
+    w.cls[0].conn.close(close_code::NORMAL, "");
+    let mut times = Vec::new();
+    for dt in 0..30 {
+        let now = t0 + ms(dt);
+        while w.cls[0].conn.poll_transmit(now, &mut buf).is_some() {
+            times.push(now - t0);
+        }
+    }
+    assert_eq!(times, vec![0, ms(5), ms(10)], "客户端 CLOSE 的发出时刻");
+
+    // 网关：20 ms 没调用端点，再 kick
+    let mut w = World::new(TakeoverPolicy::RequireFlag, 1, ideal(), 36);
+    w.connect(0);
+    w.run_until(ms(300));
+    assert!(w.gw.conn().is_some());
+    let t0 = w.now + ms(20);
+    w.gw.kick(&ClientId::of(&client_kp(0).public()), close_code::GATEWAY_ENDED);
+    let mut times = Vec::new();
+    for dt in 0..30 {
+        let now = t0 + ms(dt);
+        while let Some(t) = w.gw.poll_transmit(now, &w.syms, &mut buf) {
+            if t.dst == client_addr(0) {
+                times.push(now - t0);
+            }
+        }
+    }
+    assert_eq!(times, vec![0, ms(5), ms(10)], "网关 CLOSE 的发出时刻");
+}
+
+/// 未知 CID 的 RESET 限频（规格 §4.4）：全局每秒 50 个；同一源地址 100 ms 最多 1 个
+#[test]
+fn reset_rate_limits() {
+    let syms = Syms::default();
+    let mut buf = [0u8; BASE_PAYLOAD];
+    let unknown = |cid: u64| {
+        let mut p = vec![0u8; 80];
+        p[0] = 0x40;
+        p[1..9].copy_from_slice(&cid.to_be_bytes());
+        p
+    };
+    let mut gw = Gateway::new(gw_cfg(TakeoverPolicy::RequireFlag));
+    let mut resets = 0;
+    for i in 0..80u64 {
+        let from: SocketAddr = format!("198.51.100.{}:{}", i % 250, 40_000 + i).parse().unwrap();
+        let now = ms(1) + i;
+        gw.handle_datagram(now, from, &mut unknown(0x1000 + i), &mut |_| {});
+        while let Some(t) = gw.poll_transmit(now, &syms, &mut buf) {
+            resets += (t.len == 38) as u32;
+        }
+    }
+    assert_eq!(resets, 50, "全局每秒 50 个");
+    assert_eq!(gw.drops().get(DropReason::ResetRateLimited), 30);
+    // 下一秒恢复
+    let from: SocketAddr = "198.51.100.200:1".parse().unwrap();
+    gw.handle_datagram(secs(2), from, &mut unknown(0x1999), &mut |_| {});
+    assert!(gw.poll_transmit(secs(2), &syms, &mut buf).is_some_and(|t| t.len == 38), "下一秒应当恢复");
+
+    let mut gw = Gateway::new(gw_cfg(TakeoverPolicy::RequireFlag));
+    let from: SocketAddr = "198.51.100.1:1".parse().unwrap();
+    let mut n = 0;
+    for i in 0..10u64 {
+        let now = secs(5) + i * ms(20);
+        gw.handle_datagram(now, from, &mut unknown(0x2000 + i), &mut |_| {});
+        while let Some(t) = gw.poll_transmit(now, &syms, &mut buf) {
+            n += (t.len == 38) as u32;
+        }
+    }
+    assert_eq!(n, 2, "200 ms 里同一源地址最多 2 个");
+}
+
+/// 握手限频（规格 §4.6）：同一 /24 每秒最多 10 个 HS_INIT 走到 DH；别的前缀不受影响；
+/// 同一个 HS_INIT 的副本命中 HS_RESP 缓存，不占限频额度
+#[test]
+fn handshake_prefix_rate_limit_and_cache_hits() {
+    let syms = Syms::default();
+    let mut buf = [0u8; BASE_PAYLOAD];
+    let mut out = [0u8; BASE_PAYLOAD];
+    // 每次用新的客户端实例：新的临时密钥和 CID，时间戳递增
+    let hs_init = |k: u64, buf: &mut [u8; BASE_PAYLOAD]| -> Vec<u8> {
+        let mut c = ClientConn::new(client_cfg(0, false));
+        let init = HsInitPayload { ts: Tai64N::from_unix(1_700_000_000 + k, 0), ..init_payload() };
+        c.connect(ms(1), init);
+        let t = c.poll_transmit(ms(1), buf).expect("HS_INIT");
+        assert_eq!(t.len, HS_INIT_LEN);
+        buf[..t.len].to_vec()
+    };
+    let mut gw = Gateway::new(gw_cfg(TakeoverPolicy::Auto));
+    for k in 0..11u64 {
+        let from: SocketAddr = format!("198.51.100.{}:5000", 10 + k).parse().unwrap();
+        let mut p = hs_init(k, &mut buf);
+        gw.handle_datagram(ms(10) + k * ms(10), from, &mut p, &mut |_| {});
+        while gw.poll_transmit(ms(10) + k * ms(10), &syms, &mut out).is_some() {}
+    }
+    assert_eq!(gw.drops().get(DropReason::HsRateLimited), 1, "同一 /24 第 11 个应当被限");
+    // 别的 /24 不受影响
+    let other: SocketAddr = "203.0.113.5:5000".parse().unwrap();
+    gw.handle_datagram(ms(200), other, &mut hs_init(20, &mut buf), &mut |_| {});
+    assert_eq!(gw.drops().get(DropReason::HsRateLimited), 1);
+    // 下一秒恢复
+    let from: SocketAddr = "198.51.100.99:5000".parse().unwrap();
+    gw.handle_datagram(secs(2), from, &mut hs_init(30, &mut buf), &mut |_| {});
+    assert_eq!(gw.drops().get(DropReason::HsRateLimited), 1, "下一秒应当恢复");
+
+    // 同一个 HS_INIT 在 1 s 内重发 15 份：命中缓存，原样回 HS_RESP，不计限频
+    let mut gw = Gateway::new(gw_cfg(TakeoverPolicy::Auto));
+    let from: SocketAddr = "198.51.100.1:5000".parse().unwrap();
+    let p = hs_init(40, &mut buf);
+    let mut resps = 0;
+    for i in 0..15u64 {
+        let now = ms(10) + i * ms(20);
+        gw.handle_datagram(now, from, &mut p.clone(), &mut |_| {});
+        while gw.poll_transmit(now, &syms, &mut out).is_some() {
+            resps += 1;
+        }
+    }
+    assert_eq!(gw.drops().get(DropReason::HsRateLimited), 0, "缓存命中的副本不占限频额度");
+    assert_eq!(resps, 15, "每份副本都回同一份 HS_RESP");
 }
 
 #[test]

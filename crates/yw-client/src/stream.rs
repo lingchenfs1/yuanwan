@@ -258,6 +258,8 @@ pub struct HeadlessReport {
     pub freezes: u64,
     pub freeze_total_ms: f64,
     pub w_frames: u64,
+    /// W 帧送出后 1 s 内的解码报错（PS5 段的瑕疵；真机验收要和 YWP 造成的分开计数）
+    pub w_errors: u64,
     /// 进入 L2 的帧（M2c 才有 L2 修复，M2a 恒为 0）
     pub l2: u64,
     /// 进入 L3（彻底丢失）的帧
@@ -315,13 +317,14 @@ impl HeadlessReport {
         }
         let _ = write!(
             s,
-            ",\"first_frame_ms\":{},\"connect_ms\":{},\"freezes\":{},\"freeze_total_ms\":{},\"w_frames\":{},\"l2\":{},\"l3\":{},\
+            ",\"first_frame_ms\":{},\"connect_ms\":{},\"freezes\":{},\"freeze_total_ms\":{},\"w_frames\":{},\"w_errors\":{},\"l2\":{},\"l3\":{},\
              \"frames\":{},\"decode_p50_ms\":{},\"decode_p95_ms\":{},\"decode_errors\":{},\"recv\":{},\"lost\":{},\"reconnects\":{}}}",
             opt(self.first_frame_ms),
             opt(self.connect_ms),
             self.freezes,
             json_num(self.freeze_total_ms),
             self.w_frames,
+            self.w_errors,
             self.l2,
             self.l3,
             self.frames,
@@ -361,6 +364,7 @@ impl HeadlessReport {
             freezes,
             freeze_total_ms: ms(freeze_total),
             w_frames: st.asm.w_frames,
+            w_errors: st.asm.w_errors,
             l2: 0,
             l3: st.asm.frames_lost,
             frames: dr.frames,
@@ -454,12 +458,13 @@ impl std::fmt::Display for GuiSummary {
         let n = &self.net;
         write!(
             f,
-            "呈现 {} 帧；冻结 {} 次，共 {:.0} ms（W3C 口径）；W 帧 {}，L3 {} 帧；解码报错 {}；\
+            "呈现 {} 帧；冻结 {} 次，共 {:.0} ms（W3C 口径）；W 帧 {}（之后 1 s 内解码报错 {}），L3 {} 帧；解码报错 {}；\
              下行收到 {} 包、推算丢 {} 包；握手共 {} 次，重连 {} 次，RESET {} 次",
             self.presented,
             self.freezes,
             self.freeze_total_ms,
             n.asm.w_frames,
+            n.asm.w_errors,
             n.asm.frames_lost,
             self.decode_errors,
             n.recv,
@@ -635,6 +640,7 @@ mod tests {
             "\"freezes\":0",
             "freeze_total_ms\":0.00",
             "\"w_frames\":0",
+            "\"w_errors\":0",
             "\"l2\":0",
             "\"l3\":0",
             "\"frames\":0",

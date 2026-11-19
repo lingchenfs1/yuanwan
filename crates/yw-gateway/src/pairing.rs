@@ -244,6 +244,42 @@ fn check_entry(s: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 配对名单改了以后，经控制口让运行中的网关重读（clients-reload）
+enum Reload {
+    /// 网关回了 ok
+    Done(String),
+    /// 控制口不存在：网关没在运行
+    NotRunning,
+    /// 连不上或网关没回 ok（比如 YWP 没起来），附原因
+    Failed(String),
+}
+
+fn notify_reload(base: &Path) -> Reload {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixStream;
+    let sock = base.join("control.sock");
+    if !sock.exists() {
+        return Reload::NotRunning;
+    }
+    let mut s = match UnixStream::connect(&sock) {
+        Ok(s) => s,
+        // 留下的旧 socket 文件：网关已经不在了
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Reload::NotRunning,
+        Err(e) => return Reload::Failed(format!("连不上控制口：{e}")),
+    };
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(12)));
+    let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(3)));
+    if let Err(e) = writeln!(s, "clients-reload") {
+        return Reload::Failed(format!("写控制口失败：{e}"));
+    }
+    let mut line = String::new();
+    match BufReader::new(&s).read_line(&mut line) {
+        Ok(_) if line.trim_start().starts_with("ok") => Reload::Done(line.trim().to_string()),
+        Ok(_) => Reload::Failed(format!("网关回复「{}」", line.trim())),
+        Err(e) => Reload::Failed(format!("等回复失败：{e}")),
+    }
+}
+
 fn hex4(fp: &[u8; 4]) -> String {
     fp.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -255,7 +291,8 @@ pub const USAGE: &str = "配对子命令（keys/ 在 <目录>/keys，<目录> �
       配对串含 PSK：默认写成 600 权限的 <目录>/pair-<名字>.txt；--stdout 只在 stdout 不是终端时可用（接管道）。
       --entry 写进配对串，客户端导入时当默认入口
   yw-gateway pair list [--dir <目录>]
-  yw-gateway pair remove <名字> [--dir <目录>]";
+  yw-gateway pair remove <名字> [--dir <目录>]
+  pair add、pair remove 之后会经 <目录>/control.sock 让运行中的网关重读配对名单（clients-reload）";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Cmd {
@@ -360,6 +397,12 @@ pub fn run(args: &[String], default_dir: &Path) -> i32 {
                 if shown.is_empty() {
                     eprintln!("已配对「{name}」");
                 }
+                match notify_reload(&base) {
+                    Reload::Done(r) => eprintln!("运行中的网关已重读配对名单（{r}）"),
+                    Reload::NotRunning => {}
+                    // 没有任何已配对客户端时网关不起 YWP，这时要重启网关
+                    Reload::Failed(e) => eprintln!("没能通知运行中的网关（{e}）：重启网关后新配对才生效"),
+                }
                 shown
             })
         }
@@ -370,7 +413,15 @@ pub fn run(args: &[String], default_dir: &Path) -> i32 {
                 v.iter().map(|(n, fp)| format!("{n}\t{}", hex4(fp))).collect::<Vec<_>>().join("\n")
             }
         }),
-        Cmd::Remove { name } => pair_remove(&keys, &name).map(|_| format!("已删除「{name}」（它下次握手会被拒）")),
+        Cmd::Remove { name } => pair_remove(&keys, &name).map(|_| match notify_reload(&base) {
+            Reload::Done(r) => format!("已删除「{name}」，运行中的网关已重读配对名单（{r}）：它的会话已断开，之后的握手会被拒"),
+            Reload::NotRunning => format!("已删除「{name}」（网关没在运行；下次启动后它的握手会被拒）"),
+            Reload::Failed(e) => format!(
+                "已删除「{name}」，但没能通知运行中的网关（{e}）。在网关重读之前它的会话和握手仍然有效：\n  \
+                 请执行 echo clients-reload | nc -U {} 或重启网关",
+                base.join("control.sock").display()
+            ),
+        }),
     };
     match r {
         Ok(msg) => {
@@ -598,5 +649,36 @@ mod tests {
         pair_remove(&keys, "a").unwrap();
         assert!(pair_list(&keys).unwrap().is_empty());
         assert!(pair_remove(&keys, "a").is_err());
+    }
+
+    /// pair add、remove 之后经控制口让运行中的网关 clients-reload；网关不在时不报错
+    #[test]
+    fn notify_reload_talks_to_control_socket() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        let t = TmpDir::new("reload");
+        assert!(matches!(notify_reload(&t.0), Reload::NotRunning));
+
+        let sock = t.0.join("control.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        let srv = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            for reply in ["ok：已配对 1 个客户端", "YWP 没有启动：没有已配对的客户端"] {
+                let (mut s, _) = l.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(&s).read_line(&mut line).unwrap();
+                got.push(line.trim().to_string());
+                writeln!(s, "{reply}").unwrap();
+            }
+            got
+        });
+        assert!(matches!(notify_reload(&t.0), Reload::Done(r) if r.starts_with("ok")));
+        assert!(matches!(notify_reload(&t.0), Reload::Failed(e) if e.contains("YWP 没有启动")));
+        assert_eq!(srv.join().unwrap(), vec!["clients-reload", "clients-reload"]);
+
+        // 留下的旧 socket 文件（网关已退出）：当作没在运行
+        drop(std::fs::remove_file(&sock));
+        drop(UnixListener::bind(&sock).unwrap());
+        assert!(matches!(notify_reload(&t.0), Reload::NotRunning));
     }
 }

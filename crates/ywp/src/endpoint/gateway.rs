@@ -567,8 +567,11 @@ impl Gateway {
             !p.cands.is_empty() && now < p.last_resp + HALF_OPEN_TIMEOUT
         });
         self.resp_cache.retain(|c| now < c.at + RESP_CACHE_TTL);
+        // 60 s 没收到客户端的包：直接丢掉会话，不发 CLOSE。可能只是上行断了而下行还通，
+        // 发 CLOSE(4) 会让客户端永久停下；不发的话上行恢复后它的包换回 RESET，按 §4.4 带 resume 重握，
+        // 上行一直不通时客户端也会在下行停 30 s 后自己重握（规格 §13.2、§13.4）
         if self.conn.as_ref().is_some_and(|c| now >= c.s.last_rx + SESSION_IDLE_TIMEOUT) {
-            self.retire_conn(close_code::GATEWAY_ENDED, now);
+            self.conn = None;
             sink(GwEvent::Closed(close_code::GATEWAY_ENDED));
         }
         self.retiring.retain(|c| !c.s.close_done());

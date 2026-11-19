@@ -111,7 +111,30 @@ struct ServeShared {
     key_overflow: AtomicBool,
     /// push 失败次数（DropReason::MediaQueueFull）
     media_full: AtomicU64,
+    /// 服务线程已经退出（正常退出或 panic）：之后 push 一律失败，client_present 恒为 false
+    stopped: AtomicBool,
     status: Mutex<ServeStatus>,
+}
+
+/// 服务线程退出时（含 panic 展开）清掉共享状态：chiaki 回调不能因为服务线程死了而一直返回 false，
+/// 那会让 PS5 会话持续报 CORRUPTFRAME（没有客户端或 YWP 不可用时行为要和 M1 一样）
+struct ExitGuard {
+    shared: Arc<ServeShared>,
+    log: Arc<dyn JsonlSink>,
+}
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        self.shared.stopped.store(true, Relaxed);
+        self.shared.client_present.store(false, Relaxed);
+        let mut st = self.shared.status.lock().unwrap_or_else(|e| e.into_inner());
+        st.running = false;
+        st.client = None;
+        drop(st);
+        if std::thread::panicking() {
+            self.log.log('E', "ywp", "YWP 服务线程异常退出（panic），已停止转发；PS5 会话照常，重启网关才能恢复 YWP");
+        }
+    }
 }
 
 pub struct ServeHandle {
@@ -123,18 +146,29 @@ pub struct ServeHandle {
 }
 
 impl ServeHandle {
-    /// 在 chiaki 线程上调：try_send + wake，队列满了返回 false（视频回调据此返回 false）
+    /// 在 chiaki 线程上调：try_send + wake，队列满了返回 false（视频回调据此返回 false）。
+    /// 服务线程已退出时也返回 false，但同时清掉 client_present，回调据此照 M1 返回 true
     pub fn push(&self, m: MediaMsg) -> bool {
         match self.tx.try_send(m) {
             Ok(()) => {
                 let _ = self.waker.wake();
                 true
             }
-            Err(_) => {
+            Err(TrySendError::Full(_)) => {
                 self.shared.media_full.fetch_add(1, Relaxed);
                 false
             }
+            Err(TrySendError::Disconnected(_)) => {
+                self.shared.stopped.store(true, Relaxed);
+                self.shared.client_present.store(false, Relaxed);
+                false
+            }
         }
+    }
+
+    /// 服务线程还在不在（退出或 panic 后为 false）
+    pub fn is_running(&self) -> bool {
+        !self.shared.stopped.load(Relaxed) && !self.join.is_finished()
     }
 
     /// 现在有没有已确认的客户端（只是提示：读到的值可能已经过时一拍）
@@ -1043,7 +1077,7 @@ impl<S: DgramSock> Server<S> {
                 }
                 self.gw.kick(&id, close_code::GATEWAY_ENDED);
                 self.sync_presence(now, DetachWhy::Kicked);
-                format!("ok：已断开「{name}」（它会重新握手；不想让它再连请 pair remove）")
+                format!("ok：已断开「{name}」（客户端会停下、不会自动重连，用户可以手动再连；不想让它再连请 pair remove，再 clients-reload）")
             }
             ("clients-reload", None) => self.reload_clients(now),
             _ => "用法：clients | kick <名字或指纹> | clients-reload".into(),
@@ -1251,8 +1285,12 @@ pub fn spawn_with(
     let (tx, rx) = mpsc::sync_channel(MEDIA_QUEUE_CAP);
     let shared = Arc::new(ServeShared::default());
     let cfg = ServeConfig { port: local.port(), ..cfg };
+    let guard = ExitGuard { shared: shared.clone(), log: cfg.log.clone() };
     let srv = Server::new(sock, &cfg, &opts, keys, ctl, events, rx, shared.clone(), clock::now_us());
-    let join = std::thread::Builder::new().name("ywp".into()).spawn(move || run_loop(srv, poll))?;
+    let join = std::thread::Builder::new().name("ywp".into()).spawn(move || {
+        let _guard = guard;
+        run_loop(srv, poll)
+    })?;
     Ok(ServeHandle { tx, waker, shared, local, join })
 }
 

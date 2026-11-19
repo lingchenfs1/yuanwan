@@ -141,8 +141,11 @@ mod tests {
     }
 
     fn conf() -> GatewayConf {
-        // 端口 0：让系统挑，不和本机别的程序冲突
-        GatewayConf::merge("ywp_port=0\n", &Cli::default()).0
+        // 端口 0：让系统挑，不和本机别的程序（正在跑的网关、fakegw）冲突。
+        // gateway.conf 里写 0 会被当成没写（用默认 9420），所以直接改字段
+        let mut c = GatewayConf::merge("", &Cli::default()).0;
+        c.ywp_port = 0;
+        c
     }
 
     fn logger(t: &TmpDir) -> Arc<Logger> {
@@ -188,6 +191,7 @@ mod tests {
         let g = start(&conf(), &t.0, Arc::new(Hub::new(1)), logger(&t));
         let sv = g.serve.expect("YWP 启动了");
         assert_ne!(sv.local_addr().port(), 0);
+        assert_ne!(sv.local_addr().port(), crate::config::DEFAULT_YWP_PORT, "测试不该占用正式端口");
         assert!(!sv.client_present());
         // 等 status 刷一次
         std::thread::sleep(std::time::Duration::from_millis(300));

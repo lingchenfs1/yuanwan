@@ -13,7 +13,7 @@ const USAGE: &str = "\
       有界面，正常使用
   yw-client --headless --connect-once --duration <秒> --json [--profile <名字>] [--start]
       无界面连一次（真解码、不呈现），到时间或被拒、被关时结束，向 stdout 输出一行 JSON：
-      { ok, hs_attempts, fail_reason, first_frame_ms, connect_ms, freezes, freeze_total_ms, w_frames, l2, l3,
+      { ok, hs_attempts, fail_reason, first_frame_ms, connect_ms, freezes, freeze_total_ms, w_frames, w_errors, l2, l3,
         frames, decode_p50_ms, decode_p95_ms, decode_errors, recv, lost, reconnects }
       ok 为 false 时退出码 1。日志走 stderr
       --start：连上后发 PS5_CMD START（网关在暂停时也恢复并唤醒 PS5）

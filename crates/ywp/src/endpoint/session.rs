@@ -283,6 +283,11 @@ impl Sess {
             if c.sent >= CLOSE_COPIES.len() || now < c.t0 + CLOSE_COPIES[c.sent] {
                 return None;
             }
+            // 起点按第一份真正发出的时刻算：close()、kick() 用的是最近一次传进来的 now，
+            // 空闲时可能已落后十几毫秒，不重设的话三份会背靠背发出，扛不住突发丢包（规格 §5.5.8）
+            if c.sent == 0 {
+                c.t0 = now;
+            }
             c.sent += 1;
             let close = Small::Close(c.close.clone());
             return self.seal_packet(now, limit, std::slice::from_ref(&close), None, out);

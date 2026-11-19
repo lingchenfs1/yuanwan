@@ -270,7 +270,15 @@ fn loopback_video_config_frames_reset_reconnect() {
     let first = take_items(&dec_rx, FRAMES_PER_SESSION as usize, Duration::from_secs(3));
     assert_eq!(first.len(), FRAMES_PER_SESSION as usize, "第一个会话只收到 {} 帧", first.len());
     check_session(&first, None);
-    let st = net.stats();
+    // 统计快照每 100 ms 才刷新一次，可能还没追上：在截止时间内轮询
+    let end = Instant::now() + Duration::from_millis(500);
+    let st = loop {
+        let s = net.stats();
+        if (s.established && s.sessions == 1 && s.video_configs >= 1) || Instant::now() >= end {
+            break s;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
     assert!(st.established && st.sessions == 1, "{st:?}");
     assert!(st.hs_attempts_first >= 1 && st.hs_resp_seen);
     assert!(st.video_configs >= 1);

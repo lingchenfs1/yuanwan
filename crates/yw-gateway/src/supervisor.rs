@@ -142,6 +142,8 @@ pub struct Supervisor {
     host_id: [u8; 8],
     /// 上一次告诉 ywp 线程的 (ps_state, epoch)
     published: Option<(u8, u32)>,
+    /// 已经发现并记过「YWP 服务线程退出了」
+    ywp_dead: bool,
 }
 
 impl Supervisor {
@@ -170,6 +172,7 @@ impl Supervisor {
             ywp_why_not: glue.why_not,
             host_id,
             published: None,
+            ywp_dead: false,
         };
         if let Ok(why) = std::fs::read_to_string(sup.pause_marker()) {
             sup.state = State::Paused;
@@ -237,6 +240,7 @@ impl Supervisor {
             self.step();
             self.idr_tick();
             self.drain_serve_events();
+            self.check_serve_alive();
             self.publish_state();
             self.maybe_stats();
             std::thread::sleep(Duration::from_millis(100));
@@ -722,6 +726,19 @@ impl Supervisor {
         }
     }
 
+    /// YWP 服务线程意外退出（panic）时记一条错误，只记一次。PS5 会话不受影响（push 已改为不拒帧）
+    fn check_serve_alive(&mut self) {
+        if self.ywp_dead || self.exit {
+            return;
+        }
+        if let Some(sv) = &self.serve {
+            if !sv.is_running() {
+                self.ywp_dead = true;
+                self.log.error("ywp", "YWP 服务线程已退出，客户端连不上了；PS5 会话照常，重启网关恢复");
+            }
+        }
+    }
+
     /// 状态或 epoch 变了：写进 Hub.status，并告诉 ywp 线程（它转成 SESSION_STATUS，并填进 HS_RESP）
     fn publish_state(&mut self) {
         let cur = (self.state.ps_state(), self.hub.link.epoch().unwrap_or(0));
@@ -732,8 +749,8 @@ impl Supervisor {
         self.hub.set_status(PsStatus { ps_state: ps, epoch, since_us: now_us(), text: self.state.name().to_string() });
         let info = SessionInfo { ps_state: ps, host_id: self.host_id, epoch, resumable: false };
         match &self.serve {
-            // 队列满了下一拍再试
-            Some(sv) if !sv.push(MediaMsg::PsChanged(info)) => {}
+            // 队列满了下一拍再试（服务线程已退出就不用再试）
+            Some(sv) if !sv.push(MediaMsg::PsChanged(info)) && sv.is_running() => {}
             _ => self.published = Some(cur),
         }
     }
