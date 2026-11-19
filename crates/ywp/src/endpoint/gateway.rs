@@ -170,7 +170,8 @@ pub struct Gateway {
     pending: HashMap<Cid, Pending>,
     resp_cache: VecDeque<CachedResp>,
     conn: Option<GwConn>,
-    /// 被接管、被踢、超时的旧会话：只把 3 份 CLOSE 发完
+    /// 被接管（CLOSE(1)）、被踢（kick）、配对被删（reload_clients）的旧会话：只把 3 份 CLOSE 发完；
+    /// 60 s 静默的会话直接丢弃，不进这里
     retiring: Vec<GwConn>,
     /// 待发的握手回包和 RESET
     raw: VecDeque<(SocketAddr, Vec<u8>)>,
@@ -225,6 +226,11 @@ impl Gateway {
     }
 
     /// 会话之外的丢弃计数（握手、未知 CID、限频……）
+    /// 还有旧会话的 CLOSE 没发完（网关退出时据此等 3 份 CLOSE(5) 真正发出去）
+    pub fn closing_in_progress(&self) -> bool {
+        self.retiring.iter().any(|c| !c.s.close_done())
+    }
+
     pub fn drops(&self) -> &DropCounters {
         &self.drops
     }

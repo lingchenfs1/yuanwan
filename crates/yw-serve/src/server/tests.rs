@@ -628,6 +628,39 @@ fn shutdown_sends_close_5_and_acks() {
     assert!(!h.srv.shared.status.lock().unwrap().running);
 }
 
+/// 退出那一刻发送正被 ENOBUFS 堵着：三份 CLOSE(5) 整体后移，仍要全部发出、间隔 5 ms，之后才退出
+#[test]
+fn shutdown_while_send_blocked_still_sends_three_closes() {
+    let mut h = H::streaming();
+    // 视频包连续 3 次 ENOBUFS：挂着的包要到第 3 次失败（约 2 ms 后）才丢，这期间 flush 不组新包
+    h.srv.sock.fail.borrow_mut().extend([libc_enobufs(), libc_enobufs(), libc_enobufs()]);
+    h.video(EPOCH, p_au());
+    let t0 = h.now;
+    h.srv.turn(t0, false);
+    assert!(h.srv.pending.is_some());
+    h.srv.sock.sent.borrow_mut().clear();
+    let (ack, ack_rx) = mpsc::channel();
+    h.push(MediaMsg::Shutdown { ack });
+    let mut t = t0 + 200;
+    let mut times = Vec::new();
+    while !h.srv.exit && t < t0 + ms(300) {
+        let n0 = h.srv.sock.sent.borrow().len();
+        while h.srv.turn(t, false) {}
+        let n1 = h.srv.sock.sent.borrow().len();
+        times.extend(std::iter::repeat_n(t, n1 - n0));
+        t += 100;
+    }
+    assert!(h.srv.exit);
+    assert!(ack_rx.try_recv().is_ok());
+    assert_eq!(times.len(), 3, "退出前要发出 3 份 CLOSE(5)：{times:?}");
+    assert!(times[0] >= t0 + ms(2), "第一份在挂着的包丢掉之后：{times:?}");
+    assert!(times[1] - times[0] >= ms(5) && times[2] - times[1] >= ms(5), "{times:?}");
+    assert!(t - 100 >= times[2] + CLOSE_SETTLE, "最后一份之后再等 CLOSE_SETTLE 才退出");
+    h.now = t;
+    h.deliver();
+    assert!(h.take().contains(&CEv::Closed(close_code::GATEWAY_EXIT)));
+}
+
 #[test]
 fn control_commands_clients_kick_reload() {
     let mut h = H::streaming();

@@ -42,7 +42,7 @@ use ywp::endpoint::{Gateway, GatewayConfig, GwEvent, TakeoverPolicy};
 use ywp::msg::{ControlMsg, SessionStatus};
 use ywp::net::{classify_send_err, SendOutcome};
 use ywp::sched::VideoCarrier;
-use ywp::time::{ms, Micros, CLOSE_COPIES, ENOBUFS_MAX_TRIES, ENOBUFS_RETRY, EXIT_CLOSE_WAIT};
+use ywp::time::{ms, Micros, ENOBUFS_MAX_TRIES, ENOBUFS_RETRY, EXIT_CLOSE_WAIT};
 use ywp::wire::{FrameStatusEntry, FrameStatusKind, Need, Report, ReportVideoFields, SessionInfo};
 use ywp::{DropCounters, DropReason};
 
@@ -412,10 +412,12 @@ struct Attached {
     since: Micros,
 }
 
-/// 关闭中：3 份 CLOSE(5) 发完（或等满 200 ms）就退出
+/// 关闭中：3 份 CLOSE(5) 发完再等 CLOSE_SETTLE（或等满 200 ms）就退出
 struct Closing {
     ack: Option<Sender<()>>,
     since: Micros,
+    /// 端点里的 CLOSE 都发完、也没有挂着的包之后，再等到这个时刻退出
+    settle_at: Option<Micros>,
 }
 
 pub(crate) struct Server<S: DgramSock> {
@@ -575,7 +577,8 @@ impl<S: DgramSock> Server<S> {
             }
         }
         if let Some(c) = &self.closing {
-            t = t.min(c.since + CLOSE_COPIES[CLOSE_COPIES.len() - 1] + CLOSE_SETTLE).min(c.since + EXIT_CLOSE_WAIT);
+            // 后面几份 CLOSE 的发送时刻由 gw.next_timeout() 给出；这里只管收尾和 200 ms 兜底
+            t = t.min(c.settle_at.unwrap_or(Micros::MAX)).min(c.since + EXIT_CLOSE_WAIT);
         }
         if t <= now && !self.worked {
             t = now + SPIN_GUARD;
@@ -1047,12 +1050,17 @@ impl<S: DgramSock> Server<S> {
             self.detach(now, DetachWhy::GatewayExit);
         }
         self.log.log('I', "ywp", "YWP 服务退出（给客户端发 CLOSE(5)）");
-        self.closing = Some(Closing { ack, since: now });
+        self.closing = Some(Closing { ack, since: now, settle_at: None });
     }
 
     fn check_closing(&mut self, now: Micros) {
-        let Some(c) = &self.closing else { return };
-        let copies_done = now >= c.since + CLOSE_COPIES[CLOSE_COPIES.len() - 1] + CLOSE_SETTLE && self.pending.is_none();
+        // 看端点状态，不按墙钟推算：三份 CLOSE 的间隔从第一份真正发出时算，发送被堵（ENOBUFS）时会整体后移
+        let sent_all = !self.gw.closing_in_progress() && self.pending.is_none();
+        let Some(c) = &mut self.closing else { return };
+        if sent_all && c.settle_at.is_none() {
+            c.settle_at = Some(now + CLOSE_SETTLE);
+        }
+        let copies_done = c.settle_at.is_some_and(|t| now >= t);
         if copies_done || now >= c.since + EXIT_CLOSE_WAIT {
             if let Some(ack) = self.closing.take().and_then(|c| c.ack) {
                 let _ = ack.send(());
