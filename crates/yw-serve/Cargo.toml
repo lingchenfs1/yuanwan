@@ -1,0 +1,11 @@
+[package]
+name = "yw-serve"
+description = "网关侧的 YWP 服务（不含 chiaki）：mio 收发循环、Ingress、IdrGovernor、InputApplier、FeedbackMerge"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+ywp = { workspace = true, features = ["net"] }
+yw-media.workspace = true
+mio.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "yw-sim"
+description = "离线仿真（链路模型、合成帧源、轨迹回放、场景回归）和两个工具：fakegw、lossy-relay"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "fakegw"
+path = "src/bin/fakegw.rs"
+
+[[bin]]
+name = "lossy-relay"
+path = "src/bin/lossy_relay.rs"
+
+[dependencies]
+ywp = { workspace = true, features = ["net", "testkit"] }
+yw-media.workspace = true
+yw-serve.workspace = true

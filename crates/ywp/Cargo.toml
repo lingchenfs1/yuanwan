@@ -1,0 +1,27 @@
+[package]
+name = "ywp"
+description = "YWP 协议核心（sans-IO）：线上格式、Noise 握手与 AEAD、可靠控制、通道、调度、端点状态机"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[features]
+default = []
+# 绑网卡的 UDP socket（IP_BOUND_IF、IP_DONTFRAG）
+net = ["dep:socket2", "dep:libc"]
+# 虚拟时钟和内存管道，给测试和仿真用。
+# 单独跑本 crate 的集成测试时要加：cargo test -p ywp --features testkit
+testkit = []
+
+[dependencies]
+snow.workspace = true
+chacha20poly1305.workspace = true
+blake2.workspace = true
+hkdf.workspace = true
+subtle.workspace = true
+getrandom.workspace = true
+socket2 = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true

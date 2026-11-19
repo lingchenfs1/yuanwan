@@ -1,0 +1,21 @@
+[package]
+name = "yw-client"
+description = "桌面客户端（先做 macOS，同一套代码以后出 Windows）：SDL3 窗口、手柄、音频，FFmpeg 硬解，Opus"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "yw-client"
+path = "src/main.rs"
+
+[dependencies]
+ywp = { workspace = true, features = ["net"] }
+yw-media.workspace = true
+mio.workspace = true
+sdl3.workspace = true
+ffmpeg-sys-next.workspace = true
+opus.workspace = true
+smallvec.workspace = true
+bytes.workspace = true
+libc.workspace = true

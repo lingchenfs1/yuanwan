@@ -1,0 +1,46 @@
+# ywp 的 cargo fuzz 目标（目标文件归 A 组，本文件归协调人）。
+# 用法（要 nightly 和 cargo-fuzz）：cd crates/ywp/fuzz && cargo +nightly fuzz run outer_header
+[package]
+name = "ywp-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+ywp = { path = ".." }
+
+# 不进上层 workspace（上层的 Cargo.toml 也把这个目录 exclude 了）
+[workspace]
+
+[[bin]]
+name = "outer_header"
+path = "fuzz_targets/outer_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunks"
+path = "fuzz_targets/chunks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open_data"
+path = "fuzz_targets/open_data.rs"
+test = false
+doc = false
+bench = false

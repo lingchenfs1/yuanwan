@@ -1,0 +1,15 @@
+[package]
+name = "yw-media"
+description = "YWP 媒体层（sans-IO）：NAL 工具、RS 封装与冗余、VideoTx、Assembler、呈现时间量、音频抖动缓冲、录像格式"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+ywp.workspace = true
+reed-solomon-simd.workspace = true
+smallvec.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

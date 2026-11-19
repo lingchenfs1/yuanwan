@@ -1,11 +1,78 @@
 [workspace]
 resolver = "2"
-members = ["crates/yw-chiaki-sys", "crates/yw-gateway"]
+members = [
+    "crates/yw-chiaki-sys",
+    "crates/yw-gateway",
+    "crates/ywp",
+    "crates/yw-media",
+    "crates/yw-serve",
+    "crates/yw-client",
+    "crates/yw-sim",
+]
+# 构建隔离：默认只编不含 chiaki 的五个 crate。
+# yw-gateway、yw-chiaki-sys 的 build.rs 每次都会编 libchiaki 外壳（先校验 chiaki 补丁），
+# 要编它们时显式加 --workspace 或 -p yw-gateway。
+default-members = [
+    "crates/ywp",
+    "crates/yw-media",
+    "crates/yw-serve",
+    "crates/yw-client",
+    "crates/yw-sim",
+]
+# fuzz 子工程自成一个 workspace（它的 Cargo.toml 里有空的 [workspace] 表），不进这里
+exclude = ["crates/ywp/fuzz"]
 
 [workspace.package]
 edition = "2021"
 license = "AGPL-3.0-only"
 version = "0.1.0"
+
+# 依赖版本统一在这里定，各 crate 用 `xxx.workspace = true` 引用。
+# 要加依赖或改版本，找协调人改这里和 Cargo.lock。
+[workspace.dependencies]
+# ---- 本仓库的 crate ----
+ywp = { path = "crates/ywp" }
+yw-media = { path = "crates/yw-media" }
+yw-serve = { path = "crates/yw-serve" }
+
+# ---- 协议核心（ywp）----
+# 不开 snow 的 std feature：它会连带启用 ring 和 sha2（snow 0.10.0 的 features 表里写的是 "ring/std"，
+# 不带「?」），我们用不到。去掉 std 后 snow 是 no_std + alloc，在 std 程序里照常用。
+# risky-raw-split：取 Split() 的原始密钥，AEAD 自己做（外层头要作关联数据）。
+snow = { version = "=0.10.0", default-features = false, features = [
+    "default-resolver",
+    "use-curve25519",
+    "use-chacha20poly1305",
+    "use-blake2",
+    "use-getrandom",
+    "risky-raw-split",
+] }
+# 和 snow 0.10 用同一代 RustCrypto（aead 0.5 / digest 0.10），不引入第二份
+chacha20poly1305 = { version = "0.10.1", default-features = false }
+blake2 = "0.10.6"
+hkdf = "0.12.4"
+subtle = "2.6.1"
+getrandom = "0.3.4"
+# IP_BOUND_IF（bind_device_by_index_v4）要 all feature
+socket2 = { version = "0.6.5", features = ["all"] }
+libc = "0.2.191"
+
+# ---- 媒体层、服务循环 ----
+mio = { version = "1.2.5", features = ["os-poll", "net"] }
+reed-solomon-simd = "=3.1.0"
+smallvec = "1.16.6"
+bytes = "1.12.2"
+
+# ---- 客户端 ----
+# use-pkg-config：链接系统的 SDL3（brew 3.4）；hidapi：才有 sensor 模块
+sdl3 = { version = "=0.22.1", features = ["use-pkg-config", "hidapi"] }
+# 只要 avcodec（avutil 总是链接）；build.rs 按 libavcodec 版本给出 feature="ffmpeg_9_0" 等 cfg
+ffmpeg-sys-next = { version = "=9.1.1", default-features = false, features = ["avcodec"] }
+# opus 0.4.0 → opusic-sys 0.7.x，默认 bundled：用 cmake 静态编自带的 libopus 1.6.1，不用系统库
+opus = "=0.4.0"
+
+# ---- 测试 ----
+proptest = "1.12.0"
 
 [profile.release]
 debug = 1
