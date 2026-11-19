@@ -570,15 +570,46 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// 要 A 组实现 StaticKeypair::from_secret、decode_pairing、gateway_id 之后才能跑
     #[test]
-    #[ignore = "等 ywp 的 StaticKeypair::from_secret 实现"]
     fn keygen_writes_600_and_refuses_second() {
         let d = tmpdir("keygen");
         let pubk = keygen_in(&d).unwrap();
         assert_eq!(mode_bits(&key_path(&d)).unwrap(), 0o600);
         assert_eq!(load_keypair_in(&d).unwrap().public(), pubk);
         assert!(keygen_in(&d).unwrap_err().contains("已经有本机密钥"));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// 网关的配对串（ywp::creds::encode_pairing）→ pair import → 档案：公钥、PSK、指纹、入口都对，
+    /// 报错和打印的内容里没有配对串和 PSK
+    #[test]
+    fn pair_import_roundtrip() {
+        let d = tmpdir("pair");
+        let gw = StaticKeypair::from_secret([0x5a; 32]);
+        let psk = Secret32::new([0xc3; 32]);
+        let s = ywp::creds::encode_pairing(&gw.public(), &psk, Some("192.0.2.10:9420"));
+        let input = format!("# 注释行\n\n{s}\n");
+        let p = pair_import_into(&d, input.as_bytes(), &ImportOpts::default()).unwrap();
+        assert_eq!(p.gw_pub, gw.public());
+        assert_eq!(p.psk.expose(), psk.expose());
+        assert_eq!(p.gateway_id, ywp::crypto::gateway_id(&gw.public()));
+        assert_eq!(p.entry, "192.0.2.10:9420".parse().unwrap());
+        assert_eq!(p.name, format!("gw-{}", fingerprint(&p.gateway_id)));
+        // 落盘的档案能读回来，权限 600
+        let path = profile_path(&d, &p.name);
+        assert_eq!(mode_bits(&path).unwrap(), 0o600);
+        assert_eq!(load_profile_in(&d, &p.name).unwrap().psk.expose(), psk.expose());
+        // 同名再导入要 --replace；--entry 覆盖配对串里的入口
+        let o = ImportOpts { entry: Some("192.0.2.20:9421".into()), ..Default::default() };
+        assert!(pair_import_into(&d, s.as_bytes(), &o).unwrap_err().contains("--replace"));
+        let o = ImportOpts { replace: true, ..o };
+        assert_eq!(pair_import_into(&d, s.as_bytes(), &o).unwrap().entry, "192.0.2.20:9421".parse().unwrap());
+        // 改坏一个字符：报错里不带配对串
+        let mut bad = s.clone().into_bytes();
+        let i = bad.len() - 3;
+        bad[i] = if bad[i] == b'A' { b'B' } else { b'A' };
+        let e = pair_import_into(&d, &bad[..], &ImportOpts { replace: true, ..Default::default() }).unwrap_err();
+        assert!(!e.contains(&s[5..20]), "{e}");
         fs::remove_dir_all(&d).unwrap();
     }
 }

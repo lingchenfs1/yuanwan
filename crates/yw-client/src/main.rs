@@ -5,14 +5,17 @@ use std::process::ExitCode;
 use yw_client::config::{self, ImportOpts};
 use yw_client::decode::HwKind;
 use yw_client::play::{self, PlayOpts};
+use yw_client::stream::{self, HeadlessOpts};
 
 const USAGE: &str = "\
 用法：
   yw-client [--profile <名字>]
       有界面，正常使用
   yw-client --headless --connect-once --duration <秒> --json [--profile <名字>] [--start]
-      无界面连一次，结束时向 stdout 输出一行 JSON：
-      { ok, hs_attempts, fail_reason, first_frame_ms, freezes, freeze_total_ms, w_frames, l2, l3 }
+      无界面连一次（真解码、不呈现），到时间或被拒、被关时结束，向 stdout 输出一行 JSON：
+      { ok, hs_attempts, fail_reason, first_frame_ms, connect_ms, freezes, freeze_total_ms, w_frames, l2, l3,
+        frames, decode_p50_ms, decode_p95_ms, decode_errors, recv, lost, reconnects }
+      ok 为 false 时退出码 1。日志走 stderr
       --start：连上后发 PS5_CMD START（网关在暂停时也恢复并唤醒 PS5）
   yw-client --play <录像.h265> [--fps <帧率>] [--frames <帧数>] [--loop <遍数>] [--no-window] [--upload] [--sw]
       调试用：不连网关，读本地录像（Annex-B HEVC，带参数集头），按帧率（默认 60）送解码、到达即呈现，
@@ -44,8 +47,6 @@ enum Command {
     Gui { profile: Option<String> },
     Headless {
         profile: Option<String>,
-        // 第二轮（net 线程）实现无界面模式时用
-        #[allow(dead_code)]
         opts: Headless,
     },
     Play(PlayOpts),
@@ -163,9 +164,9 @@ fn print_versions() {
 }
 
 /// 连网关之前的检查：档案能读、本机密钥在；默认路由走隧道又没指定网卡时提示
-fn preflight(profile: Option<&str>) -> Result<config::GatewayProfile, String> {
+fn preflight(profile: Option<&str>) -> Result<(config::GatewayProfile, ywp::crypto::StaticKeypair), String> {
     let p = config::select_profile(profile)?;
-    config::load_keypair()?;
+    let kp = config::load_keypair()?;
     if p.bind_if.is_none() {
         if let Some(i) = yw_client::platform::route_iface(p.entry.ip()) {
             if yw_client::platform::is_tunnel_iface(&i) {
@@ -175,7 +176,7 @@ fn preflight(profile: Option<&str>) -> Result<config::GatewayProfile, String> {
             }
         }
     }
-    Ok(p)
+    Ok((p, kp))
 }
 
 fn run(cmd: Command) -> Result<ExitCode, String> {
@@ -230,9 +231,30 @@ fn run(cmd: Command) -> Result<ExitCode, String> {
             println!("{rep}");
             Ok(if rep.decode_errors() == 0 { ExitCode::SUCCESS } else { ExitCode::from(1) })
         }
-        Command::Gui { profile } | Command::Headless { profile, .. } => {
-            preflight(profile.as_deref())?;
-            Err("连网关的部分（net 线程）还没实现，M2a 第二轮做；现在可以用 --play 验证解码和呈现".into())
+        Command::Gui { profile } => {
+            let (p, kp) = preflight(profile.as_deref())?;
+            eprintln!("连网关「{}」：入口 {}，网卡 {}", p.name, p.entry, p.bind_if.as_deref().unwrap_or("（不绑）"));
+            let sum = stream::run_gui(&p, kp, HwKind::VideoToolbox)?;
+            eprintln!("{sum}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Headless { profile, opts } => {
+            // 档案、密钥有问题也输出一行 JSON，脚本好统一处理
+            let rep = match preflight(profile.as_deref()) {
+                Ok((mut p, kp)) => {
+                    if opts.start {
+                        p.auto_start = true;
+                    }
+                    let o = HeadlessOpts { duration_s: opts.duration_s.unwrap_or(0), hw: HwKind::VideoToolbox };
+                    stream::run_headless(&p, kp, &o)
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    stream::HeadlessReport { fail_reason: Some("config".into()), ..Default::default() }
+                }
+            };
+            println!("{}", rep.to_json());
+            Ok(if rep.ok { ExitCode::SUCCESS } else { ExitCode::from(1) })
         }
     }
 }

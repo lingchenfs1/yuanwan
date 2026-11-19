@@ -4,7 +4,6 @@
 //! 线程和正式客户端一样：decode 线程（USER_INTERACTIVE）解码，经信箱（最多 3 帧）交给主线程，
 //! 并用 SDL 自定义事件叫醒主线程；主线程收到就呈现。
 
-use crate::annexb;
 use crate::clock;
 use crate::decode::{log_stats, DecStats, DecodedFrame, FfmpegDecoder, HwKind, VideoDecoder};
 use crate::overlay::{FpsCounter, OverlayStats, Samples};
@@ -12,11 +11,14 @@ use crate::present::{Presenter, PresenterExt, PresenterStats, SdlMetalPresenter,
 use sdl3::sys::events::*;
 use sdl3::sys::keycode::{SDLK_ESCAPE, SDLK_Q};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError, TrySendError};
 use std::sync::Arc;
 use ywp::time::Micros;
+use yw_media::nal;
+use yw_media::playout::FreezeMeter;
+use yw_media::ywf::AnnexBReader;
 use yw_media::Codec;
 
 /// 信箱容量：Presenter 信箱最多 3 帧
@@ -82,7 +84,9 @@ pub struct PlayReport {
     present_lat: Samples,
     /// 相邻两次呈现的间隔
     present_gap: Samples,
+    /// W3C 口径（yw-media 的 FreezeMeter，按呈现时刻）
     pub freezes: u32,
+    pub freeze_total_ms: f64,
     pub missing_ref_logs: u64,
     pub error_logs: u64,
     pub stopped_by_user: bool,
@@ -145,7 +149,7 @@ impl fmt::Display for PlayReport {
             write!(
                 f,
                 "呈现（{}）：{} 帧（零拷贝 {}，上传 {}），被新帧顶掉 {}，信箱满丢弃 {}，建纹理失败 {}；\
-                 出帧到呈现完成 P50 {:.2} ms、P95 {:.2} ms；呈现间隔 P50 {:.2} ms、P95 {:.2} ms、最大 {:.2} ms；冻结 {} 次（W3C 口径，本地估算）",
+                 出帧到呈现完成 P50 {:.2} ms、P95 {:.2} ms；呈现间隔 P50 {:.2} ms、P95 {:.2} ms、最大 {:.2} ms；冻结 {} 次、共 {:.0} ms（W3C 口径）",
                 self.renderer,
                 self.presented,
                 self.present.zero_copy,
@@ -159,21 +163,47 @@ impl fmt::Display for PlayReport {
                 ms(pg.pct(95.0)),
                 ms(pg.max()),
                 self.freezes,
+                self.freeze_total_ms,
             )?;
         }
         Ok(())
     }
 }
 
-/// W3C 口径的冻结次数：呈现间隔 ≥ max(3 × 平均帧间隔, 平均帧间隔 + 150 ms)。
-/// TODO(E 组)：yw-media 的 FreezeMeter 交付后改用它（它按滑动平均算，这里按整段平均估）
-fn count_freezes(gaps: &[u64]) -> u32 {
-    if gaps.is_empty() {
-        return 0;
+/// 读进来的录像：每个 AU 带 4 字节起始码；关键帧前面补上参数集（和 Assembler 交给解码线程的一样）
+#[derive(Debug, Default)]
+pub struct Clip {
+    pub aus: Vec<Vec<u8>>,
+    /// 文件开头的参数集
+    pub params: Vec<u8>,
+}
+
+/// 用 yw-media 的 AnnexBReader 把录像（Annex-B，带参数集头）切成 AU。
+/// 中途单独出现的参数集并进后面那一帧；关键帧前面没有参数集时补上最新的一份
+pub fn load_clip(path: &Path, c: Codec) -> Result<Clip, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("读不到 {}：{e}", path.display()))?;
+    let mut r = AnnexBReader::new(std::io::BufReader::new(f), c);
+    let mut clip = Clip::default();
+    let mut prefix: Vec<u8> = Vec::new();
+    while let Some(au) = r.next_au().map_err(|e| format!("读 {} 出错：{e}", path.display()))? {
+        if nal::is_param_sets_only(&au, c) {
+            prefix = au;
+            continue;
+        }
+        let key = nal::is_keyframe(&au, c);
+        if prefix.is_empty() && key && !nal::starts_with_param_set(&au, c) {
+            prefix = r.param_sets().to_vec();
+        }
+        if prefix.is_empty() {
+            clip.aus.push(au);
+        } else {
+            let mut v = std::mem::take(&mut prefix);
+            v.extend_from_slice(&au);
+            clip.aus.push(v);
+        }
     }
-    let avg = gaps.iter().sum::<u64>() as f64 / gaps.len() as f64;
-    let th = (3.0 * avg).max(avg + 150_000.0);
-    gaps.iter().filter(|&&g| g as f64 >= th).count() as u32
+    clip.params = r.param_sets().to_vec();
+    Ok(clip)
 }
 
 /// 叫醒主线程的 SDL 自定义事件（0 表示没开窗口）
@@ -189,8 +219,7 @@ fn wake_main(t: WakeType) {
 }
 
 fn decode_thread(
-    data: Arc<Vec<u8>>,
-    aus: Arc<Vec<std::ops::Range<usize>>>,
+    aus: Arc<Vec<Vec<u8>>>,
     params: Vec<u8>,
     o: PlayOpts,
     tx: Option<mpsc::SyncSender<DecodedFrame>>,
@@ -217,7 +246,7 @@ fn decode_thread(
         } else {
             clock::sleep_until(due);
         }
-        let au = &data[aus[i % aus.len()].clone()];
+        let au = &aus[i % aus.len()];
         let sent_at = clock::now_us();
         s.sent += 1;
         match dec.decode(au) {
@@ -257,9 +286,7 @@ fn decode_thread(
 /// 主线程跑：放完（或窗口被关掉）才返回
 pub fn run(o: &PlayOpts) -> Result<PlayReport, String> {
     clock::init();
-    let data = std::fs::read(&o.path).map_err(|e| format!("读不到 {}：{e}", o.path.display()))?;
-    let aus = annexb::split_aus(&data, Codec::Hevc);
-    let params = annexb::leading_param_sets(&data, Codec::Hevc);
+    let Clip { aus, params } = load_clip(&o.path, Codec::Hevc)?;
     if aus.is_empty() {
         return Err("录像里切不出 AU（要 Annex-B 的 HEVC）".into());
     }
@@ -268,7 +295,6 @@ pub fn run(o: &PlayOpts) -> Result<PlayReport, String> {
     }
     let mut rep = PlayReport { aus: aus.len(), params_len: params.len(), ..Default::default() };
     let log0 = log_stats();
-    let data = Arc::new(data);
     let aus = Arc::new(aus);
     let stop = Arc::new(AtomicBool::new(false));
     let _activity = crate::platform::begin_latency_critical_activity();
@@ -276,10 +302,10 @@ pub fn run(o: &PlayOpts) -> Result<PlayReport, String> {
 
     if !o.window {
         let h = {
-            let (data, aus, o, stop) = (data.clone(), aus.clone(), o.clone(), stop.clone());
+            let (aus, o, stop) = (aus.clone(), o.clone(), stop.clone());
             std::thread::Builder::new()
                 .name("decode".into())
-                .spawn(move || decode_thread(data, aus, params, o, None, 0, stop))
+                .spawn(move || decode_thread(aus, params, o, None, 0, stop))
                 .map_err(|e| e.to_string())?
         };
         rep.dec = h.join().map_err(|_| "decode 线程 panic".to_string())??;
@@ -298,16 +324,16 @@ pub fn run(o: &PlayOpts) -> Result<PlayReport, String> {
     }
     let (tx, rx) = mpsc::sync_channel::<DecodedFrame>(MAILBOX);
     let h = {
-        let (data, aus, o, stop) = (data.clone(), aus.clone(), o.clone(), stop.clone());
+        let (aus, o, stop) = (aus.clone(), o.clone(), stop.clone());
         std::thread::Builder::new()
             .name("decode".into())
-            .spawn(move || decode_thread(data, aus, params, o, Some(tx), wake, stop))
+            .spawn(move || decode_thread(aus, params, o, Some(tx), wake, stop))
             .map_err(|e| e.to_string())?
     };
 
     let mut fps = FpsCounter::default();
     let mut last_present: Option<Micros> = None;
-    let mut gaps = Vec::new();
+    let mut freeze = FreezeMeter::new();
     let mut last_pushed: Option<(u64, Micros)> = None; // (fid, decoded_us)
     let mut ov = OverlayStats::default();
     // 这一秒里每帧的「预定送入时刻 → 出帧」，给浮层算解码 P95
@@ -356,16 +382,15 @@ pub fn run(o: &PlayOpts) -> Result<PlayReport, String> {
                 }
             }
             if let Some(lp) = last_present {
-                let g = st.presented_us - lp;
-                rep.present_gap.push(g);
-                gaps.push(g);
+                rep.present_gap.push(st.presented_us - lp);
             }
+            freeze.on_present(st.presented_us);
             last_present = Some(st.presented_us);
             if fps.tick(st.presented_us) {
                 let ls = log_stats();
                 ov.fps = fps.fps();
                 ov.frames = rep.presented;
-                ov.freezes = count_freezes(&gaps);
+                ov.freezes = freeze.freezes().len() as u32;
                 ov.dec_p95_ms = dec_win.pct(95.0) as f32 / 1000.0;
                 dec_win.clear();
                 ov.missing_ref = ls.missing_ref - log0.missing_ref;
@@ -379,7 +404,8 @@ pub fn run(o: &PlayOpts) -> Result<PlayReport, String> {
     rep.dec = h.join().map_err(|_| "decode 线程 panic".to_string())??;
     rep.elapsed_us = clock::now_us() - t0;
     rep.present = presenter.stats();
-    rep.freezes = count_freezes(&gaps);
+    rep.freezes = freeze.freezes().len() as u32;
+    rep.freeze_total_ms = freeze.total_us() as f64 / 1000.0;
     finish_logs(&mut rep, log0);
     drop(presenter);
     Ok(rep)
@@ -400,15 +426,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn freeze_rule() {
-        // 60 fps，中间一次 300 ms 的停顿：算一次
-        let mut g = vec![16_667u64; 600];
-        g[300] = 300_000;
-        assert_eq!(count_freezes(&g), 1);
-        // 100 ms 的停顿不到「平均 + 150 ms」：不算
-        g[300] = 100_000;
-        assert_eq!(count_freezes(&g), 0);
-        assert_eq!(count_freezes(&[]), 0);
+    fn load_clip_prefixes_params_on_keyframes() {
+        fn hevc(t: u8, rest: &[u8]) -> Vec<u8> {
+            let mut v = vec![0, 0, 0, 1, t << 1, 1];
+            v.extend_from_slice(rest);
+            v
+        }
+        let mut ps = hevc(32, &[0xaa]);
+        ps.extend(hevc(33, &[0xbb]));
+        ps.extend(hevc(34, &[0xcc]));
+        let k0 = hevc(19, &[0x80, 1, 2]);
+        let p1 = hevc(1, &[0x80, 3]);
+        let sps2 = hevc(33, &[0xdd]);
+        let k2 = hevc(20, &[0x80, 4]);
+        let mut file = ps.clone();
+        for x in [&k0, &p1, &sps2, &k2] {
+            file.extend_from_slice(x);
+        }
+        let path = std::env::temp_dir().join(format!("yw-client-clip-{}.h265", std::process::id()));
+        std::fs::write(&path, &file).unwrap();
+        let clip = load_clip(&path, Codec::Hevc);
+        let _ = std::fs::remove_file(&path);
+        let clip = clip.unwrap();
+        assert_eq!(clip.aus.len(), 3);
+        // 开头的参数集补到第一个关键帧前面
+        let mut want0 = ps.clone();
+        want0.extend_from_slice(&k0);
+        assert_eq!(clip.aus[0], want0);
+        assert_eq!(clip.aus[1], p1);
+        // 中途换的参数集并进后面那一帧
+        let mut want2 = sps2.clone();
+        want2.extend_from_slice(&k2);
+        assert_eq!(clip.aus[2], want2);
+        assert!(nal::is_keyframe(&clip.aus[2], Codec::Hevc));
+        assert!(load_clip(Path::new("/nonexistent/yw.h265"), Codec::Hevc).is_err());
     }
 
     /// 不开窗口，只解码：整条 --play 路径（读文件、切 AU、decode 线程、统计）能跑完

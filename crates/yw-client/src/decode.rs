@@ -461,8 +461,8 @@ impl VideoDecoder for FfmpegDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annexb;
     use crate::overlay::Samples;
+    use crate::play::{load_clip, Clip};
 
     #[test]
     fn classify_log_lines() {
@@ -483,10 +483,11 @@ mod tests {
         d.flush();
     }
 
-    /// 录像路径：环境变量 YW_TEST_H265（Annex-B，带参数集头），没设就跳过
-    fn test_clip() -> Option<Vec<u8>> {
+    /// 录像路径：环境变量 YW_TEST_H265（Annex-B，带参数集头），没设就跳过。
+    /// 用 yw-media 的 AnnexBReader 切 AU，关键帧前面补上参数集（和网络路径一样）
+    fn test_clip() -> Option<Clip> {
         let path = std::env::var_os("YW_TEST_H265")?;
-        Some(std::fs::read(&path).unwrap_or_else(|e| panic!("读不到 YW_TEST_H265：{e}")))
+        Some(load_clip(std::path::Path::new(&path), Codec::Hevc).unwrap_or_else(|e| panic!("读不到 YW_TEST_H265：{e}")))
     }
 
     /// 解码基准：逐帧送进 VideoToolbox，量首帧冷启动、送入到出帧的 P50/P95，
@@ -494,12 +495,10 @@ mod tests {
     /// `YW_TEST_H265=<录像> cargo test -p yw-client --release vt_decode_bench -- --nocapture`
     #[test]
     fn vt_decode_bench() {
-        let Some(data) = test_clip() else {
+        let Some(Clip { aus, params }) = test_clip() else {
             eprintln!("没设 YW_TEST_H265，跳过解码基准");
             return;
         };
-        let aus = annexb::split_aus(&data, Codec::Hevc);
-        let params = annexb::leading_param_sets(&data, Codec::Hevc);
         assert!(!aus.is_empty() && !params.is_empty(), "录像里找不到 AU 或参数集");
         let max = std::env::var("YW_TEST_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
         let log0 = log_stats();
@@ -515,9 +514,9 @@ mod tests {
         let mut errors = 0u64;
         let mut corrupt = 0u64;
         let n = aus.len().min(max);
-        for r in aus.iter().take(n) {
+        for au in aus.iter().take(n) {
             let s = crate::clock::now_us();
-            match d.decode(&data[r.clone()]) {
+            match d.decode(au) {
                 Ok(Some(f)) => {
                     let e = crate::clock::now_us();
                     if cold_us.is_none() {
@@ -567,16 +566,14 @@ mod tests {
     /// 中途重开：参数集变了要重开，没变不重开；码流里自带参数集时不靠 extradata 也能解
     #[test]
     fn vt_reconfigure_mid_session() {
-        let Some(data) = test_clip() else {
+        let Some(Clip { aus, params }) = test_clip() else {
             eprintln!("没设 YW_TEST_H265，跳过");
             return;
         };
-        let aus = annexb::split_aus(&data, Codec::Hevc);
-        let params = annexb::leading_param_sets(&data, Codec::Hevc);
         let mut d = FfmpegDecoder::new(HwKind::VideoToolbox).unwrap();
         d.configure(Codec::Hevc, &params).unwrap();
-        for r in aus.iter().take(10) {
-            assert!(d.decode(&data[r.clone()]).unwrap().is_some());
+        for au in aus.iter().take(10) {
+            assert!(d.decode(au).unwrap().is_some());
         }
         d.configure(Codec::Hevc, &params).unwrap();
         assert_eq!(d.stats().opens, 1, "参数集没变不该重开");
@@ -584,15 +581,15 @@ mod tests {
         // 换一份「参数集」（这里用空的，模拟 cfg_ver 变了）：重开，从关键帧（自带参数集）起照样出帧
         d.configure(Codec::Hevc, &[]).unwrap();
         assert_eq!(d.stats().opens, 2);
-        assert!(annexb::is_keyframe(&data[aus[0].clone()], Codec::Hevc));
-        for r in aus.iter().take(5) {
-            assert!(d.decode(&data[r.clone()]).unwrap().is_some());
+        assert!(yw_media::nal::is_keyframe(&aus[0], Codec::Hevc));
+        for au in aus.iter().take(5) {
+            assert!(d.decode(au).unwrap().is_some());
         }
         // 再换回来，flush 之后从关键帧继续
         d.configure(Codec::Hevc, &params).unwrap();
         d.flush();
         assert_eq!(d.stats().opens, 3);
-        assert!(d.decode(&data[aus[0].clone()]).unwrap().is_some());
+        assert!(d.decode(&aus[0]).unwrap().is_some());
         assert_eq!(d.stats().max_lag, 0);
     }
 }
