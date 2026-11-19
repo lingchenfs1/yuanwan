@@ -42,7 +42,9 @@ typedef struct
 	void *user;
 	void (*on_log)(void *user, int level, const char *msg);
 	void (*on_event)(void *user, int type, int code, const char *text);
-	void (*on_video)(void *user, const uint8_t *buf, size_t size, int32_t frames_lost, int recovered);
+	// 返回 0 表示网关没收下这一帧（比如队列满）。video_cb 把它原样交还给 chiaki：
+	// chiaki 就不把这一帧记作参考帧，下一帧开始时向 PS5 报 CORRUPTFRAME，引用它的 P 帧由 chiaki 改参考或丢弃
+	int (*on_video)(void *user, const uint8_t *buf, size_t size, int32_t frames_lost, int recovered);
 	void (*on_audio_header)(void *user, uint32_t channels, uint32_t bits, uint32_t rate, uint32_t frame_size);
 	void (*on_audio)(void *user, const uint8_t *buf, size_t size);
 	void (*on_haptics)(void *user, const uint8_t *buf, size_t size);

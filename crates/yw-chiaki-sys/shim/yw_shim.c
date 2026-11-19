@@ -41,9 +41,10 @@ static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
 static bool video_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user)
 {
 	yw_session *s = user;
-	if(s->cb.on_video)
-		s->cb.on_video(s->cb.user, buf, buf_size, frames_lost, frame_recovered ? 1 : 0);
-	return true;
+	if(!s->cb.on_video)
+		return true;
+	// 返回 false 时 chiaki 不把这一帧记作参考，下一帧开始时报 CORRUPTFRAME（见 yw_shim.h）
+	return s->cb.on_video(s->cb.user, buf, buf_size, frames_lost, frame_recovered ? 1 : 0) != 0;
 }
 
 // 必须注册音频接收端：chiaki-ng v1.10.1 在没有接收端时（audioreceiver.c:259）直接 return，会漏掉音频缓冲

@@ -6,13 +6,19 @@
 //! 用法见 `yw-gateway --help`。在 macOS 上要装成 LaunchDaemon 运行（见 deploy/macos/），
 //! 用户级 LaunchAgent 会被本地网络隐私拦截，连不上 PS5。
 
+mod config;
 mod control;
 mod cred;
 mod discovery;
 mod handler;
+// TODO(协调人给 yw-gateway 加上 ywp、yw-serve 依赖后)：打开下一行（hub.rs 已按 yw_serve::PsControl 写好），
+// M2a 第二轮由 serve_glue 和 supervisor 接上
+// mod hub;
 mod jlog;
+mod pairing;
 mod supervisor;
 
+use config::{Cli, GatewayConf, HoldAction};
 use std::fs::OpenOptions;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -22,7 +28,10 @@ use supervisor::{Config, Supervisor};
 use yw_chiaki_sys::Codec;
 
 const USAGE: &str = "用法：yw-gateway --host <PS5 地址> [选项]
-  <目录>/gateway.conf 里有 host=<地址> 时以它为准，优先于 --host（PS5 换 IP 只改这个文件、重启网关，不用改 LaunchDaemon 的 plist）
+       yw-gateway keygen | pair …（配对子命令，见 yw-gateway pair --help）
+  <目录>/gateway.conf（每行 key=value，# 开头是注释）里写了的项优先于命令行（PS5 换 IP 只改这个文件、重启网关，
+  不用改 LaunchDaemon 的 plist）。认识的 key：host、bitrate_kbps、lan_max_kbps、loss_max、hold_minutes（0 = 一直持有）、
+  hold_action（none | sleep）、ywp_port（默认 9420）、ywp_bind_if（网卡名，留空不绑）、ywp_takeover（0 | 1，默认 0）
   --cred <文件>        PS5 凭据（默认 ~/.config/yw/ps5.cred）
   --dir <目录>         日志、控制口、锁文件所在目录（默认 ~/yw-gw）
   --res 1080|720|540|360   分辨率（默认 1080）
@@ -41,12 +50,19 @@ const USAGE: &str = "用法：yw-gateway --host <PS5 地址> [选项]
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    if matches!(args.first().map(String::as_str), Some("keygen" | "pair")) {
+        if args.iter().any(|a| a == "-h" || a == "--help") {
+            println!("{}", pairing::USAGE);
+            return;
+        }
+        std::process::exit(pairing::run(&args, &PathBuf::from(&home).join("yw-gw")));
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{USAGE}");
         return;
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let mut host = None;
+    let mut cli = Cli::default();
     let mut cred_path = PathBuf::from(&home).join(".config/yw/ps5.cred");
     let mut dir = PathBuf::from(&home).join("yw-gw");
     let mut cfg = Config {
@@ -74,12 +90,12 @@ fn main() {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "--host" => host = Some(need(i).clone()),
+            "--host" => cli.host = Some(need(i).clone()),
             "--cred" => cred_path = PathBuf::from(need(i)),
             "--dir" => dir = PathBuf::from(need(i)),
             "--res" => cfg.height = need(i).parse().unwrap_or(1080),
             "--fps" => cfg.fps = need(i).parse().unwrap_or(60),
-            "--bitrate" => cfg.bitrate_kbps = need(i).parse().unwrap_or(15000),
+            "--bitrate" => cli.bitrate_kbps = need(i).parse().ok(),
             "--codec" => {
                 cfg.codec = match need(i).as_str() {
                     "h264" => Codec::H264,
@@ -88,16 +104,13 @@ fn main() {
                 }
             }
             "--ls-mtu" => cfg.ls_mtu = need(i).parse().unwrap_or(1236),
-            "--loss-max" => cfg.loss_max = need(i).parse().unwrap_or(0.03),
+            "--loss-max" => cli.loss_max = need(i).parse().ok(),
             "--stats" => cfg.stats_interval = Duration::from_secs(need(i).parse().unwrap_or(10)),
-            "--hold" => {
-                let mins: u64 = need(i).parse().unwrap_or(0);
-                cfg.hold = (mins > 0).then(|| Duration::from_secs(mins * 60));
-            }
+            "--hold" => cli.hold_minutes = Some(need(i).parse().unwrap_or(0)),
             "--no-wake" | "--hold-sleep" | "--quiet-stderr" => {
                 match a {
                     "--no-wake" => cfg.wake = false,
-                    "--hold-sleep" => cfg.hold_sleep = true,
+                    "--hold-sleep" => cli.hold_sleep = true,
                     _ => quiet_stderr = true,
                 }
                 i += 1;
@@ -111,13 +124,17 @@ fn main() {
         i += 2;
     }
     // gateway.conf 优先：PS5 换 IP 时不必改 /Library/LaunchDaemons 里的 plist（那要 sudo）
-    let conf_host = read_conf_host(&dir.join("gateway.conf"));
-    let host_from_conf = conf_host.is_some();
-    let Some(host) = conf_host.or(host) else {
+    let (conf, sources) = GatewayConf::load(&dir.join("gateway.conf"), &cli);
+    let Some(host) = conf.host.clone() else {
         eprintln!("{USAGE}");
         std::process::exit(2);
     };
     cfg.host = host;
+    cfg.bitrate_kbps = conf.bitrate_kbps;
+    cfg.loss_max = conf.loss_max;
+    // M2a 仍按 M1：哪里都没写 hold_minutes 时不限时（M2d 起默认 10 分钟）；0 也是不限时
+    cfg.hold = conf.hold_minutes.filter(|&m| m > 0).map(|m| Duration::from_secs(m as u64 * 60));
+    cfg.hold_sleep = conf.hold_action == HoldAction::Sleep;
 
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("建不了目录 {}：{e}", dir.display());
@@ -150,10 +167,12 @@ fn main() {
         }
     };
     log.info("gateway", &format!("yw-gateway {} 启动，主机「{}」", env!("CARGO_PKG_VERSION"), cred.nickname));
-    log.info(
-        "gateway",
-        &format!("PS5 地址 {}（来自{}）", cfg.host, if host_from_conf { " gateway.conf" } else { "命令行 --host" }),
-    );
+    let host_src = sources.iter().find(|(k, _)| k == "host").map(|(_, s)| s.label()).unwrap_or("?");
+    log.info("gateway", &format!("PS5 地址 {}（来自{host_src}）", cfg.host));
+    log.info("gateway", &format!("配置：{}", conf.summary(&sources)));
+    for w in &conf.warnings {
+        log.warn("gateway", w);
+    }
     yw_chiaki_sys::install_signal_handlers();
 
     let (tx, rx) = mpsc::channel();
@@ -163,16 +182,4 @@ fn main() {
     Supervisor::new(cfg, cred, log).run(rx);
     let _ = std::fs::remove_file(dir.join("control.sock"));
     drop(lock);
-}
-
-/// 读 gateway.conf 里的 `host=`（`#` 开头是注释）。文件不存在或没有这一项时返回 None。
-fn read_conf_host(path: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .find(|(k, _)| k.trim() == "host")
-        .map(|(_, v)| v.trim().to_string())
-        .filter(|v| !v.is_empty() && !v.contains(char::is_whitespace))
 }

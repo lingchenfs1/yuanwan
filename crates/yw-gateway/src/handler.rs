@@ -341,11 +341,12 @@ impl Handler for GwHandler {
         }
     }
 
-    fn on_video(&self, data: &[u8], frames_lost: i32, recovered: bool) {
+    /// M2a 第一轮：照常总是收下（返回 true），行为和 M1 一样。接上 yw-serve 之后改成 ServeHandle::push 的结果
+    fn on_video(&self, data: &[u8], frames_lost: i32, recovered: bool) -> bool {
         let s = &self.s;
         if is_param_sets_only(data, s.hevc) {
             *s.header.lock().unwrap_or_else(|e| e.into_inner()) = data.to_vec();
-            return;
+            return true;
         }
         let key = is_keyframe(data, s.hevc);
         let t = now_us();
@@ -373,6 +374,7 @@ impl Handler for GwHandler {
                 }
             }
         }
+        true
     }
 
     fn on_audio(&self, _data: &[u8]) {

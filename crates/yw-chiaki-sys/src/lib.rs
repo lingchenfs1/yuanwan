@@ -60,7 +60,7 @@ struct RawCallbacks {
     user: *mut c_void,
     on_log: Option<LogFn>,
     on_event: Option<extern "C" fn(*mut c_void, c_int, c_int, *const c_char)>,
-    on_video: Option<extern "C" fn(*mut c_void, *const u8, usize, i32, c_int)>,
+    on_video: Option<extern "C" fn(*mut c_void, *const u8, usize, i32, c_int) -> c_int>,
     on_audio_header: Option<extern "C" fn(*mut c_void, u32, u32, u32, u32)>,
     on_audio: Option<extern "C" fn(*mut c_void, *const u8, usize)>,
     on_haptics: Option<extern "C" fn(*mut c_void, *const u8, usize)>,
@@ -158,7 +158,11 @@ pub enum Event {
 pub trait Handler: Send + Sync + 'static {
     fn on_log(&self, _level: u32, _msg: &str) {}
     fn on_event(&self, _ev: Event) {}
-    fn on_video(&self, _data: &[u8], _frames_lost: i32, _recovered: bool) {}
+    /// 返回 false 表示没收下这一帧（比如队列满）：chiaki 不把它记作参考帧，下一帧开始时向 PS5 报 CORRUPTFRAME，
+    /// 引用它的 P 帧由 chiaki 改参考（recovered）或丢弃。回调 panic 也按 false 处理
+    fn on_video(&self, _data: &[u8], _frames_lost: i32, _recovered: bool) -> bool {
+        true
+    }
     fn on_audio_header(&self, _channels: u32, _bits: u32, _rate: u32, _frame_size: u32) {}
     fn on_audio(&self, _data: &[u8]) {}
     fn on_haptics(&self, _data: &[u8]) {}
@@ -211,12 +215,14 @@ extern "C" fn tr_event(user: *mut c_void, ty: c_int, code: c_int, text: *const c
     let _ = catch_unwind(AssertUnwindSafe(|| handler(user).on_event(ev)));
 }
 
-extern "C" fn tr_video(user: *mut c_void, buf: *const u8, size: usize, frames_lost: i32, recovered: c_int) {
+extern "C" fn tr_video(user: *mut c_void, buf: *const u8, size: usize, frames_lost: i32, recovered: c_int) -> c_int {
     if buf.is_null() {
-        return;
+        // chiaki 不会交空指针；万一有，按收下处理，不影响它的参考帧记账
+        return 1;
     }
     let data = unsafe { std::slice::from_raw_parts(buf, size) };
-    let _ = catch_unwind(AssertUnwindSafe(|| handler(user).on_video(data, frames_lost, recovered != 0)));
+    let ok = catch_unwind(AssertUnwindSafe(|| handler(user).on_video(data, frames_lost, recovered != 0))).unwrap_or(false);
+    ok as c_int
 }
 
 extern "C" fn tr_audio_header(user: *mut c_void, ch: u32, bits: u32, rate: u32, fs: u32) {

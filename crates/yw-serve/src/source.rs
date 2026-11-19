@@ -2,6 +2,7 @@
 //! 以及服务循环交给网关监督线程的 ServeEvent。
 
 use crate::idr::{IdrDecision, IdrReason};
+use crate::ingress::StreamInfo;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,6 +25,11 @@ pub trait PsControl: Send + Sync {
     fn params(&self, epoch: u32) -> Option<Arc<[u8]>>;
     /// 音频头最新值槽
     fn audio_header(&self, epoch: u32) -> Option<AudioHeader>;
+    /// 这一路会话的编码、帧率、分辨率（写进 VIDEO_CONFIG，见 Ingress::set_stream）。
+    /// 默认 None：Ingress 从参数集判断编码，fps 和分辨率填 0
+    fn stream_info(&self, _epoch: u32) -> Option<StreamInfo> {
+        None
+    }
 }
 
 /// 音频头（同现有外壳的 on_audio_header）
