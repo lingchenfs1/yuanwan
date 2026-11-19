@@ -96,6 +96,22 @@ pub struct PsLink {
     epoch: AtomicU32,
     /// PS5 会话的 request_idr 返回错误的次数
     idr_errors: AtomicU64,
+    /// with() 的计时（含等锁）：ywp 线程会同步调 chiaki（请求 IDR、手柄），被卡住时要看得出来（计划 §7.7）
+    with_calls: AtomicU64,
+    with_slow: AtomicU64,
+    with_max_us: AtomicU64,
+}
+
+/// with() 用时超过这个值记一次「慢」
+const WITH_SLOW_US: u64 = 5_000;
+
+/// PsLink::with 的计时统计
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WithStats {
+    pub calls: u64,
+    /// 用时 ≥ 5 ms 的次数
+    pub slow: u64,
+    pub max_us: u64,
 }
 
 impl PsLink {
@@ -107,12 +123,31 @@ impl PsLink {
             installs: AtomicU32::new(0),
             epoch: AtomicU32::new(0),
             idr_errors: AtomicU64::new(0),
+            with_calls: AtomicU64::new(0),
+            with_slow: AtomicU64::new(0),
+            with_max_us: AtomicU64::new(0),
         }
     }
 
-    /// 持锁时间 = 一次 chiaki 调用。没有会话时返回 None
+    /// 持锁时间 = 一次 chiaki 调用。没有会话时返回 None。用时（含等锁）记进 with_stats
     pub fn with<R>(&self, f: impl FnOnce(&dyn PsSession) -> R) -> Option<R> {
-        lock(&self.session).as_deref().map(f)
+        let t0 = std::time::Instant::now();
+        let r = lock(&self.session).as_deref().map(f);
+        let us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        self.with_calls.fetch_add(1, Relaxed);
+        if us >= WITH_SLOW_US {
+            self.with_slow.fetch_add(1, Relaxed);
+        }
+        self.with_max_us.fetch_max(us, Relaxed);
+        r
+    }
+
+    pub fn with_stats(&self) -> WithStats {
+        WithStats {
+            calls: self.with_calls.load(Relaxed),
+            slow: self.with_slow.load(Relaxed),
+            max_us: self.with_max_us.load(Relaxed),
+        }
     }
 
     /// 装上新会话，返回新 epoch = (boot_id << 16) | 本次启动以来的会话序号。
@@ -462,6 +497,11 @@ mod tests {
         ctl.set_controller_full(&st);
         ctl.set_controller_idle();
         assert_eq!(calls(&c), ["full:8001", "idle"]);
+        // 每次 with 都计时（没有会话那次也算）；假会话不会慢
+        let w = hub.link.with_stats();
+        assert_eq!(w.calls, 3);
+        assert_eq!(w.slow, 0);
+        assert!(w.max_us < 5_000);
     }
 
     #[test]

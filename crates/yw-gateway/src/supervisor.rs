@@ -685,13 +685,14 @@ impl Supervisor {
             last_frame_ms
         );
         let idr = self.hub.link.idr_stats();
+        let wst = self.hub.link.with_stats();
         let ps = self.hub.status();
         let ywp = match &self.serve {
             Some(sv) => sv.status().to_json(),
             None => format!("{{\"running\":false,\"why\":\"{}\"}}", escape(&self.ywp_why_not)),
         };
         format!(
-            "{},\"frames_recovered\":{recovered},\"media_full\":{media_full},\"ps_state\":{},\"state_ms\":{},\"epoch\":{},\"idr\":{{\"sent\":{},\"resent\":{},\"coalesced\":{},\"deferred\":{},\"escalated\":{},\"satisfied\":{},\"errors\":{}}},\"ywp\":{ywp}}}",
+            "{},\"frames_recovered\":{recovered},\"media_full\":{media_full},\"ps_state\":{},\"state_ms\":{},\"epoch\":{},\"idr\":{{\"sent\":{},\"resent\":{},\"coalesced\":{},\"deferred\":{},\"escalated\":{},\"satisfied\":{},\"errors\":{}}},\"chiaki_calls\":{{\"n\":{},\"slow\":{},\"max_ms\":{:.1}}},\"ywp\":{ywp}}}",
             &m1[..m1.len() - 1],
             ps.ps_state,
             now_us().saturating_sub(ps.since_us) / 1000,
@@ -703,6 +704,9 @@ impl Supervisor {
             idr.escalated,
             idr.satisfied,
             self.hub.link.idr_errors(),
+            wst.calls,
+            wst.slow,
+            wst.max_us as f64 / 1000.0,
         )
     }
 
