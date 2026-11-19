@@ -1,0 +1,62 @@
+diff --git a/lib/include/chiaki/session.h b/lib/include/chiaki/session.h
+index e578ae1..54e285a 100644
+--- a/lib/include/chiaki/session.h
++++ b/lib/include/chiaki/session.h
+@@ -282,6 +282,7 @@ typedef struct chiaki_session_t
+ 	volatile double yw_inject_loss; // yw 补丁：< 0 表示关闭
+ 	uint32_t yw_ls_mtu;    // yw 补丁：非 0 时覆盖 LaunchSpec 里的 mtu
+ 	uint32_t yw_ls_rtt_ms; // yw 补丁：非 0 时覆盖 LaunchSpec 里的 rtt（毫秒）
++	struct senkusha_t *yw_senkusha; // yw 补丁：Senkusha 运行期间指向它，chiaki_session_stop 用来取消（受 state_mutex 保护）
+ } ChiakiSession;
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_init(ChiakiSession *session, ChiakiConnectInfo *connect_info, ChiakiLog *log);
+diff --git a/lib/src/session.c b/lib/src/session.c
+index fc5a470..7c0c866 100644
+--- a/lib/src/session.c
++++ b/lib/src/session.c
+@@ -321,6 +321,16 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_stop(ChiakiSession *session)
+ 	chiaki_stop_pipe_stop(&session->stop_pipe);
+ 	chiaki_cond_signal(&session->state_cond);
+ 
++	// yw 补丁：Senkusha 不看 session->should_stop，要单独通知它
++	if(session->yw_senkusha)
++	{
++		ChiakiSenkusha *senkusha = session->yw_senkusha;
++		chiaki_mutex_lock(&senkusha->state_mutex);
++		senkusha->should_stop = true;
++		chiaki_mutex_unlock(&senkusha->state_mutex);
++		chiaki_cond_signal(&senkusha->state_cond);
++	}
++
+ 	chiaki_stream_connection_stop(&session->stream_connection);
+ 
+ 	chiaki_mutex_unlock(&session->state_mutex);
+@@ -624,7 +634,15 @@ ctrl_failed:
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 		QUIT(quit_ctrl);
+ 
++	// yw 补丁：运行 Senkusha 期间释放 state_mutex（原来一直持有，chiaki_session_stop 会被挡最长约 30 s），
++	// 并登记指针，让 chiaki_session_stop 能取消它。senkusha 内部不碰 session 的 state_mutex。
++	session->yw_senkusha = &senkusha;
++	if(session->should_stop)
++		senkusha.should_stop = true;
++	chiaki_mutex_unlock(&session->state_mutex);
+ 	err = chiaki_senkusha_run(&senkusha, &session->mtu_in, &session->mtu_out, &session->rtt_us, data_sock);
++	chiaki_mutex_lock(&session->state_mutex);
++	session->yw_senkusha = NULL;
+ 	chiaki_senkusha_fini(&senkusha);
+ 	CHECK_STOP(quit_ctrl);
+ 	if(session->ctrl_failed)
+diff --git a/lib/src/streamconnection.c b/lib/src/streamconnection.c
+index 9ab2518..d75b974 100644
+--- a/lib/src/streamconnection.c
++++ b/lib/src/streamconnection.c
+@@ -229,7 +229,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+ 
+ 	err = chiaki_cond_timedwait_pred(&stream_connection->state_cond, &stream_connection->state_mutex, EXPECT_TIMEOUT_MS, state_finished_cond_check, stream_connection);
+ 	assert(err == CHIAKI_ERR_SUCCESS || err == CHIAKI_ERR_TIMEOUT);
+-	CHECK_STOP(close_takion);
++	CHECK_STOP(err_congestion_control); // yw 补丁：原来跳到 close_takion，拥塞控制线程在 takion 关闭后还在跑
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{
+ 		CHIAKI_LOGE(session->log, "StreamConnection Takion connect failed");

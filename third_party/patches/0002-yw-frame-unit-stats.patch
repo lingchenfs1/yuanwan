@@ -1,0 +1,65 @@
+diff --git a/lib/include/chiaki/frameprocessor.h b/lib/include/chiaki/frameprocessor.h
+index bcac03e..1471258 100644
+--- a/lib/include/chiaki/frameprocessor.h
++++ b/lib/include/chiaki/frameprocessor.h
+@@ -42,6 +42,9 @@ typedef struct chiaki_frame_processor_t
+ 	size_t unit_slots_size;
+ 	bool flushed; // whether we have already flushed the current frame, i.e. are only interested in stats, not data.
+ 	ChiakiStreamStats stream_stats;
++	uint64_t yw_first_us; // yw 补丁：本帧首个单元到达时间（单调时钟，微秒）
++	uint64_t yw_last_us;  // yw 补丁：本帧最后一个单元到达时间
++	unsigned int yw_fec_raw; // yw 补丁：包头里原始的 FEC 单元数（未做最少 1 的修正）
+ } ChiakiFrameProcessor;
+ 
+ typedef enum chiaki_frame_flush_result_t {
+diff --git a/lib/src/frameprocessor.c b/lib/src/frameprocessor.c
+index 47f0061..2bfe539 100644
+--- a/lib/src/frameprocessor.c
++++ b/lib/src/frameprocessor.c
+@@ -3,6 +3,7 @@
+ #include <chiaki/frameprocessor.h>
+ #include <chiaki/fec.h>
+ #include <chiaki/video.h>
++#include <chiaki/time.h>
+ 
+ #include <jerasure.h>
+ 
+@@ -73,6 +74,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_frame_processor_alloc_frame(ChiakiFrameProc
+ 	}
+ 
+ 	frame_processor->flushed = false;
++	frame_processor->yw_first_us = frame_processor->yw_last_us = chiaki_time_now_monotonic_us(); // yw 补丁
++	frame_processor->yw_fec_raw = packet->units_in_frame_fec; // yw 补丁
+ 	frame_processor->units_source_expected = packet->units_in_frame_total - packet->units_in_frame_fec;
+ 	frame_processor->units_fec_expected = packet->units_in_frame_fec;
+ 	if(frame_processor->units_fec_expected < 1)
+@@ -149,6 +152,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_frame_processor_alloc_frame(ChiakiFrameProc
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_frame_processor_put_unit(ChiakiFrameProcessor *frame_processor, ChiakiTakionAVPacket *packet)
+ {
++	frame_processor->yw_last_us = chiaki_time_now_monotonic_us(); // yw 补丁
+ 	if(packet->unit_index >= packet->units_in_frame_total)
+ 	{
+ 		CHIAKI_LOGE(frame_processor->log, "Packet's unit index is outside frame unit count");
+diff --git a/lib/src/videoreceiver.c b/lib/src/videoreceiver.c
+index c20c9b6..5df80c2 100644
+--- a/lib/src/videoreceiver.c
++++ b/lib/src/videoreceiver.c
+@@ -178,6 +178,17 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
+ 	if(video_receiver->frame_index_cur < 0 ||
+ 		chiaki_seq_num_16_gt(frame_index, (ChiakiSeqNum16)video_receiver->frame_index_cur))
+ 	{
++		if(video_receiver->frame_index_cur >= 0)
++		{
++			// yw 补丁：上一帧的单元统计与到达时间跨度
++			ChiakiFrameProcessor *yw_fp = &video_receiver->frame_processor;
++			CHIAKI_LOGV(video_receiver->log, "[yw-frame] idx=%d prof=%d src=%u/%u fec=%u/%u fec_raw=%u t0=%llu span_us=%llu unit=%zu",
++				(int)video_receiver->frame_index_cur, (int)video_receiver->profile_cur,
++				yw_fp->units_source_received, yw_fp->units_source_expected,
++				yw_fp->units_fec_received, yw_fp->units_fec_expected, yw_fp->yw_fec_raw,
++				(unsigned long long)yw_fp->yw_first_us, (unsigned long long)(yw_fp->yw_last_us - yw_fp->yw_first_us),
++				yw_fp->buf_size_per_unit);
++		}
+ 		if(video_receiver->packet_stats)
+ 			chiaki_frame_processor_report_packet_stats(&video_receiver->frame_processor, video_receiver->packet_stats);
+ 

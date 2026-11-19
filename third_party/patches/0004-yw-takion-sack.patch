@@ -1,0 +1,193 @@
+diff --git a/lib/include/chiaki/takionsendbuffer.h b/lib/include/chiaki/takionsendbuffer.h
+index a8b3ef1..6e48ce4 100644
+--- a/lib/include/chiaki/takionsendbuffer.h
++++ b/lib/include/chiaki/takionsendbuffer.h
+@@ -58,6 +58,17 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_buffer_push(ChiakiTakionSendBuf
+  */
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_buffer_ack(ChiakiTakionSendBuffer *send_buffer, ChiakiSeqNum32 seq_num, ChiakiSeqNum32 *acked_seq_nums, size_t *acked_seq_nums_count);
+ 
++/**
++ * yw：按 SACK 的 gap block 确认 [first, last] 区间内的包（不是累计确认）。
++ * @param acked_seq_nums 同 chiaki_takion_send_buffer_ack，结果追加在 *acked_seq_nums_count 之后
++ */
++CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_buffer_ack_range(ChiakiTakionSendBuffer *send_buffer, ChiakiSeqNum32 first, ChiakiSeqNum32 last, ChiakiSeqNum32 *acked_seq_nums, size_t *acked_seq_nums_count);
++
++/**
++ * yw：SACK 显示 seq_num 缺失时立即重发一次（快速重传），距上次发送不足 min_age_ms 则不重发。
++ */
++CHIAKI_EXPORT void chiaki_takion_send_buffer_resend_now(ChiakiTakionSendBuffer *send_buffer, ChiakiSeqNum32 seq_num, uint64_t min_age_ms);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/lib/src/ctrl.c b/lib/src/ctrl.c
+index 7b1ce49..9231444 100644
+--- a/lib/src/ctrl.c
++++ b/lib/src/ctrl.c
+@@ -892,8 +892,9 @@ static void ctrl_message_received(ChiakiCtrl *ctrl, uint16_t msg_type, uint8_t *
+ 			ctrl_message_received_switch_to_stream_connection(ctrl, payload, payload_size);
+ 			break;
+ 		default:
+-			// CHIAKI_LOGW(ctrl->session->log, "Received Ctrl Message with unknown type %#x", msg_type);
+-			chiaki_log_hexdump(ctrl->session->log, CHIAKI_LOG_WARNING, payload, payload_size);
++			// yw：记下类型号，否则只有一段 hexdump，没法判断是哪种消息（已知 0x41 每次会话开头都来一条 8 字节）
++			CHIAKI_LOGI(ctrl->session->log, "Ctrl received unhandled message type %#x, size %#llx", (unsigned int)msg_type, (unsigned long long)payload_size);
++			chiaki_log_hexdump(ctrl->session->log, CHIAKI_LOG_INFO, payload, payload_size);
+ 			break;
+ 	}
+ }
+diff --git a/lib/src/takion.c b/lib/src/takion.c
+index 9916009..adf54e9 100644
+--- a/lib/src/takion.c
++++ b/lib/src/takion.c
+@@ -1456,15 +1456,30 @@ static void takion_handle_packet_message_data(ChiakiTakion *takion, uint8_t *pac
+ 	entry->channel = ntohs(*((chiaki_unaligned_uint16_t *)(payload + 4)));
+ 	ChiakiSeqNum32 seq_num = ntohl(*((chiaki_unaligned_uint32_t *)(payload + 0)));
+ 
+-	chiaki_reorder_queue_push(&takion->data_queue, seq_num, entry);
++	// yw：已交付过的序号（PS5 没收到我们的 ack 而重发）也要立即再 ack 一次（RFC 4960 6.2），
++	// 否则 PS5 会一直重发，日志里就是成串的「Takion dropping data with seq num」
++	ChiakiSeqNum32 cumulative = (ChiakiSeqNum32)(takion->data_queue.begin - 1);
++	bool already_delivered = !chiaki_seq_num_32_gt(seq_num, cumulative);
++
++	chiaki_reorder_queue_push(&takion->data_queue, seq_num, entry); // 重复的会经 drop_cb 释放
++	if(already_delivered)
++	{
++		chiaki_takion_send_message_data_ack(takion, cumulative);
++		return;
++	}
+ 	takion_flush_data_queue(takion);
+ }
+ 
+ static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t flags, uint8_t *buf, size_t buf_size)
+ {
+-	if(buf_size != 0xc)
+-	{
+-		CHIAKI_LOGE(takion->log, "Takion received data ack with size %zx != %#x", buf_size, 0xc);
++	// yw：DATA_ACK 和 SCTP 的 SACK 一样是变长的：12 字节固定部分
++	// （cumulative u32、a_rwnd u32、gap 块数 u16、重复 TSN 数 u16），
++	// 后跟 gap 块数 × 4 字节（start/end 两个 u16，相对 cumulative 的偏移）和重复 TSN 数 × 4 字节。
++	// 原代码只收 12 字节，PS5 一发带 1 个 gap 块或 1 个重复 TSN 的 16 字节 ack 就整条丢掉，
++	// 连其中的累计确认也丢了。
++	if(buf_size < 0xc)
++	{
++		CHIAKI_LOGE(takion->log, "Takion received data ack with size %#zx < %#x", buf_size, 0xc);
+ 		return;
+ 	}
+ 
+@@ -1473,15 +1488,13 @@ static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t
+ 	uint16_t gap_ack_blocks_count = ntohs(*((chiaki_unaligned_uint16_t *)(buf + 8)));
+ 	uint16_t dup_tsns_count = ntohs(*((chiaki_unaligned_uint16_t *)(buf + 0xa)));
+ 
+-	if(buf_size != gap_ack_blocks_count * 4 + 0xc)
++	if(buf_size != 0xc + (size_t)gap_ack_blocks_count * 4 + (size_t)dup_tsns_count * 4)
+ 	{
+-		CHIAKI_LOGW(takion->log, "Takion received data ack with invalid gap_ack_blocks_count");
++		CHIAKI_LOGW(takion->log, "Takion received data ack with size %#zx not matching %u gap blocks and %u dup tsns",
++				buf_size, (unsigned int)gap_ack_blocks_count, (unsigned int)dup_tsns_count);
+ 		return;
+ 	}
+ 
+-	if(dup_tsns_count != 0)
+-		CHIAKI_LOGW(takion->log, "Takion received data ack with nonzero dup_tsns_count %#x", dup_tsns_count);
+-
+ 	CHIAKI_LOGV(takion->log, "Takion received data ack with cumulative_seq_num = %#x, a_rwnd = %#x, gap_ack_blocks_count = %#x, dup_tsns_count = %#x",
+ 			cumulative_seq_num, a_rwnd, gap_ack_blocks_count, dup_tsns_count);
+ 
+@@ -1489,6 +1502,32 @@ static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t
+ 	size_t acked_seq_nums_count = 0;
+ 	chiaki_takion_send_buffer_ack(&takion->send_buffer, cumulative_seq_num, acked_seq_nums, &acked_seq_nums_count);
+ 
++	// gap 块：PS5 已收到、但在缺口之后的包，从发送缓冲里移除，免得每 200 ms 白白重发
++	uint16_t prev_end = 0;
++	for(uint16_t g=0; g<gap_ack_blocks_count; g++)
++	{
++		uint16_t start = ntohs(*((chiaki_unaligned_uint16_t *)(buf + 0xc + 4 * (size_t)g)));
++		uint16_t end = ntohs(*((chiaki_unaligned_uint16_t *)(buf + 0xc + 4 * (size_t)g + 2)));
++		if(start == 0 || end < start || (g > 0 && start <= prev_end + 1))
++		{
++			CHIAKI_LOGW(takion->log, "Takion received data ack with malformed gap block %u: %#x..%#x", (unsigned int)g, start, end);
++			break;
++		}
++		prev_end = end;
++		chiaki_takion_send_buffer_ack_range(&takion->send_buffer,
++				(ChiakiSeqNum32)(cumulative_seq_num + start), (ChiakiSeqNum32)(cumulative_seq_num + end),
++				acked_seq_nums, &acked_seq_nums_count);
++	}
++
++	// 快速重传：有 gap 说明 cumulative+1 起的包丢了，不等 200 ms 定时器；
++	// 每个包距上次发送至少 20 ms 才重发，避免一串 SACK 触发一串重发
++	if(gap_ack_blocks_count > 0)
++	{
++		uint16_t first_start = ntohs(*((chiaki_unaligned_uint16_t *)(buf + 0xc)));
++		for(uint32_t off=1; off<first_start && off<=8; off++)
++			chiaki_takion_send_buffer_resend_now(&takion->send_buffer, (ChiakiSeqNum32)(cumulative_seq_num + off), 20);
++	}
++
+ 	for(size_t i=0; i<acked_seq_nums_count; i++)
+ 	{
+ 		ChiakiTakionEvent event = { 0 };
+diff --git a/lib/src/takionsendbuffer.c b/lib/src/takionsendbuffer.c
+index 0d7f756..0746e4c 100644
+--- a/lib/src/takionsendbuffer.c
++++ b/lib/src/takionsendbuffer.c
+@@ -188,6 +188,59 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_buffer_ack(ChiakiTakionSendBuff
+ 	return err;
+ }
+ 
++CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_buffer_ack_range(ChiakiTakionSendBuffer *send_buffer, ChiakiSeqNum32 first, ChiakiSeqNum32 last, ChiakiSeqNum32 *acked_seq_nums, size_t *acked_seq_nums_count)
++{
++	ChiakiErrorCode err = chiaki_mutex_lock(&send_buffer->mutex);
++	if(err != CHIAKI_ERR_SUCCESS)
++		return err;
++
++	// 保持原有顺序做原地压缩：区间内的包释放掉，其余前移
++	size_t w = 0;
++	for(size_t r=0; r<send_buffer->packets_count; r++)
++	{
++		ChiakiTakionSendBufferPacket *packet = &send_buffer->packets[r];
++		bool in_range = !chiaki_seq_num_32_lt(packet->seq_num, first) && !chiaki_seq_num_32_gt(packet->seq_num, last);
++		if(in_range)
++		{
++			if(acked_seq_nums && acked_seq_nums_count)
++				acked_seq_nums[(*acked_seq_nums_count)++] = packet->seq_num;
++			free(packet->buf);
++			continue;
++		}
++		if(w != r)
++			send_buffer->packets[w] = *packet;
++		w++;
++	}
++	send_buffer->packets_count = w;
++
++	chiaki_mutex_unlock(&send_buffer->mutex);
++	return err;
++}
++
++CHIAKI_EXPORT void chiaki_takion_send_buffer_resend_now(ChiakiTakionSendBuffer *send_buffer, ChiakiSeqNum32 seq_num, uint64_t min_age_ms)
++{
++	if(!send_buffer->takion)
++		return;
++	if(chiaki_mutex_lock(&send_buffer->mutex) != CHIAKI_ERR_SUCCESS)
++		return;
++	uint64_t now = chiaki_time_now_monotonic_ms();
++	for(size_t i=0; i<send_buffer->packets_count; i++)
++	{
++		ChiakiTakionSendBufferPacket *packet = &send_buffer->packets[i];
++		if(packet->seq_num != seq_num)
++			continue;
++		if(now - packet->last_send_ms >= min_age_ms && packet->tries < TAKION_DATA_RESEND_TRIES_MAX)
++		{
++			CHIAKI_LOGI(send_buffer->log, "Takion Send Buffer fast re-sending packet with seqnum %#llx (SACK gap), tries: %llu", (unsigned long long)packet->seq_num, (unsigned long long)packet->tries);
++			packet->last_send_ms = now;
++			chiaki_takion_send_raw(send_buffer->takion, packet->buf, packet->buf_size);
++			packet->tries++;
++		}
++		break;
++	}
++	chiaki_mutex_unlock(&send_buffer->mutex);
++}
++
+ static void takion_send_buffer_resend(ChiakiTakionSendBuffer *send_buffer);
+ 
+ static bool takion_send_buffer_check_pred_packets(void *user)

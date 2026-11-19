@@ -1,0 +1,92 @@
+diff --git a/lib/include/chiaki/congestioncontrol.h b/lib/include/chiaki/congestioncontrol.h
+index ffd22a3..5f63dde 100644
+--- a/lib/include/chiaki/congestioncontrol.h
++++ b/lib/include/chiaki/congestioncontrol.h
+@@ -19,6 +19,7 @@ typedef struct chiaki_congestion_control_t
+ 	ChiakiBoolPredCond stop_cond;
+ 	double packet_loss;
+ 	double packet_loss_max;
++	const volatile double *yw_inject_loss; // yw 补丁：非空且 >= 0 时，用它替代实测丢包率上报给主机
+ } ChiakiCongestionControl;
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_congestion_control_start(ChiakiCongestionControl *control, ChiakiTakion *takion, ChiakiPacketStats *stats, double packet_loss_max);
+diff --git a/lib/include/chiaki/session.h b/lib/include/chiaki/session.h
+index e90ecea..4c6e275 100644
+--- a/lib/include/chiaki/session.h
++++ b/lib/include/chiaki/session.h
+@@ -278,6 +278,8 @@ typedef struct chiaki_session_t
+ 	ChiakiStreamConnection stream_connection;
+ 
+ 	ChiakiControllerState controller_state;
++
++	volatile double yw_inject_loss; // yw 补丁：< 0 表示关闭
+ } ChiakiSession;
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_init(ChiakiSession *session, ChiakiConnectInfo *connect_info, ChiakiLog *log);
+@@ -289,6 +291,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_join(ChiakiSession *session);
+ CHIAKI_EXPORT void chiaki_session_send_event(ChiakiSession *session, ChiakiEvent *event);
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_request_idr(ChiakiSession *session);
++/** yw 补丁：实验用。loss >= 0 时按该丢包率（0~1）向主机上报拥塞，< 0 恢复正常上报。 */
++CHIAKI_EXPORT void chiaki_session_yw_set_inject_loss(ChiakiSession *session, double loss);
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_set_controller_state(ChiakiSession *session, ChiakiControllerState *state);
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_set_login_pin(ChiakiSession *session, const uint8_t *pin, size_t pin_size);
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_set_stream_connection_switch_received(ChiakiSession *session);
+diff --git a/lib/src/congestioncontrol.c b/lib/src/congestioncontrol.c
+index 6409528..15bc74c 100644
+--- a/lib/src/congestioncontrol.c
++++ b/lib/src/congestioncontrol.c
+@@ -25,7 +25,18 @@ static void *congestion_control_thread_func(void *user)
+ 		ChiakiTakionCongestionPacket packet = { 0 };
+ 		uint64_t total = received + lost;
+ 		control->packet_loss = total > 0 ? (double)lost / total : 0;
+-		if(control->packet_loss > control->packet_loss_max)
++		double yw_inject = control->yw_inject_loss ? *control->yw_inject_loss : -1.0;
++		if(yw_inject >= 0.0)
++		{
++			// yw 补丁：实验用，按指定丢包率上报（不受 packet_loss_max 限制）
++			if(yw_inject > 1.0)
++				yw_inject = 1.0;
++			lost = (uint64_t)(total * yw_inject + 0.5);
++			received = total - lost;
++			CHIAKI_LOGV(control->takion->log, "[yw-cc] measured=%.4f injected=%.4f total=%llu",
++				control->packet_loss, yw_inject, (unsigned long long)total);
++		}
++		else if(control->packet_loss > control->packet_loss_max)
+ 		{
+ 			CHIAKI_LOGD(control->takion->log, "Clamping reported packet loss: measured=%.1f%% reported_max=%.1f%%",
+ 				control->packet_loss * 100.0, control->packet_loss_max * 100.0);
+diff --git a/lib/src/session.c b/lib/src/session.c
+index 41c6bbf..2264a89 100644
+--- a/lib/src/session.c
++++ b/lib/src/session.c
+@@ -183,6 +183,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_init(ChiakiSession *session, Chiaki
+ 	session->holepunch_session = connect_info->holepunch_session;
+ 	session->rudp = NULL;
+ 	session->dontfrag = true;
++	session->yw_inject_loss = -1.0; // yw 补丁
+ 
+ 	ChiakiErrorCode err = chiaki_cond_init(&session->state_cond);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+@@ -1190,3 +1191,9 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_go_home(ChiakiSession *session)
+ 	err = ctrl_message_go_home(&session->ctrl);
+ 	return err;
+ }
++
++// yw 补丁：实验用，见 chiaki_session_yw_set_inject_loss 的说明
++CHIAKI_EXPORT void chiaki_session_yw_set_inject_loss(ChiakiSession *session, double loss)
++{
++	session->yw_inject_loss = loss;
++}
+diff --git a/lib/src/streamconnection.c b/lib/src/streamconnection.c
+index afa1a60..e26bdd1 100644
+--- a/lib/src/streamconnection.c
++++ b/lib/src/streamconnection.c
+@@ -219,6 +219,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+ 		goto err_video_receiver;
+ 	}
+ 
++	stream_connection->congestion_control.yw_inject_loss = &stream_connection->session->yw_inject_loss; // yw 补丁
+ 	err = chiaki_congestion_control_start(&stream_connection->congestion_control, &stream_connection->takion, &stream_connection->packet_stats, stream_connection->packet_loss_max);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{

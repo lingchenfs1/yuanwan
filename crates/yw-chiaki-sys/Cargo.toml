@@ -1,0 +1,10 @@
+[package]
+name = "yw-chiaki-sys"
+description = "libchiaki（chiaki-ng v1.10.1 + yw 补丁）的外壳库绑定，只在网关里用"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+build = "build.rs"
+links = "yw_all"
+
+[dependencies]

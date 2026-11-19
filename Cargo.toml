@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/yw-chiaki-sys", "crates/yw-gateway"]
+
+[workspace.package]
+edition = "2021"
+license = "AGPL-3.0-only"
+version = "0.1.0"
+
+[profile.release]
+debug = 1

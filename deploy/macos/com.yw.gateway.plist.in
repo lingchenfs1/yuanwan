@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  yw-gateway 的 LaunchDaemon 配置（装到 /Library/LaunchDaemons/）。
+  必须是 LaunchDaemon：用户级 LaunchAgent 会被 macOS 15 的本地网络隐私拦截，连不上 PS5（苹果 TN3179）。
+  以 UserName 指定的普通用户身份运行，不需要 root 权限。
+  更新程序：在开发机上运行 tools/deploy-gateway.sh（先传成 yw-gateway.new，校验签名后 mv 原子替换，再发 quit，
+  KeepAlive 会用新程序重启）。不要用 scp、cp 直接覆盖正在运行的程序：内核按 vnode 缓存代码签名，原地改写可能被 SIGKILL。
+  暂停（pause、sleep、PS5 主动结束串流）会写 __HOME__/yw-gw/paused，网关重启后仍暂停，用 resume 解除。
+  PS5 地址写在 __HOME__/yw-gw/gateway.conf（一行 host=地址），换 IP 改那个文件再 quit 即可，不用 sudo。
+  这是模板：install.sh 会把 __USER__、__HOME__ 换成运行它的用户，再装到 /Library/LaunchDaemons/。
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.yw.gateway</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__HOME__/yw-gw/bin/yw-gateway</string>
+		<string>--cred</string>
+		<string>__HOME__/.config/yw/ps5.cred</string>
+		<string>--dir</string>
+		<string>__HOME__/yw-gw</string>
+		<string>--quiet-stderr</string>
+	</array>
+	<key>UserName</key>
+	<string>__USER__</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>__HOME__</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<!-- 异常退出后至少隔 10 秒再拉起，避免狂刷 PS5 -->
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<!-- SIGTERM 后给 40 秒正常结束 PS5 会话（被强杀会让 PS5 返回约 10 秒的 IN_USE；Senkusha 阶段的握手最长要等几秒） -->
+	<key>ExitTimeOut</key>
+	<integer>40</integer>
+	<!-- 网关对延迟敏感，不要被系统按后台进程节流 -->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/yw-gw/stdout.log</string>
+	<!-- stderr 只有错误和警告（--quiet-stderr），完整日志在 gateway.jsonl（50 MB 轮转） -->
+	<key>StandardErrorPath</key>
+	<string>__HOME__/yw-gw/stderr.log</string>
+</dict>
+</plist>

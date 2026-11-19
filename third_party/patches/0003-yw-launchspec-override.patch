@@ -1,0 +1,56 @@
+diff --git a/lib/include/chiaki/session.h b/lib/include/chiaki/session.h
+index 4c6e275..e578ae1 100644
+--- a/lib/include/chiaki/session.h
++++ b/lib/include/chiaki/session.h
+@@ -280,6 +280,8 @@ typedef struct chiaki_session_t
+ 	ChiakiControllerState controller_state;
+ 
+ 	volatile double yw_inject_loss; // yw 补丁：< 0 表示关闭
++	uint32_t yw_ls_mtu;    // yw 补丁：非 0 时覆盖 LaunchSpec 里的 mtu
++	uint32_t yw_ls_rtt_ms; // yw 补丁：非 0 时覆盖 LaunchSpec 里的 rtt（毫秒）
+ } ChiakiSession;
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_init(ChiakiSession *session, ChiakiConnectInfo *connect_info, ChiakiLog *log);
+@@ -293,6 +295,8 @@ CHIAKI_EXPORT void chiaki_session_send_event(ChiakiSession *session, ChiakiEvent
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_request_idr(ChiakiSession *session);
+ /** yw 补丁：实验用。loss >= 0 时按该丢包率（0~1）向主机上报拥塞，< 0 恢复正常上报。 */
+ CHIAKI_EXPORT void chiaki_session_yw_set_inject_loss(ChiakiSession *session, double loss);
++/** yw 补丁：实验用。在 chiaki_session_start 之前调用；mtu / rtt_ms 为 0 表示用 Senkusha 实测值。 */
++CHIAKI_EXPORT void chiaki_session_yw_set_launchspec_override(ChiakiSession *session, uint32_t mtu, uint32_t rtt_ms);
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_set_controller_state(ChiakiSession *session, ChiakiControllerState *state);
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_set_login_pin(ChiakiSession *session, const uint8_t *pin, size_t pin_size);
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_set_stream_connection_switch_received(ChiakiSession *session);
+diff --git a/lib/src/session.c b/lib/src/session.c
+index 2264a89..fc5a470 100644
+--- a/lib/src/session.c
++++ b/lib/src/session.c
+@@ -1197,3 +1197,10 @@ CHIAKI_EXPORT void chiaki_session_yw_set_inject_loss(ChiakiSession *session, dou
+ {
+ 	session->yw_inject_loss = loss;
+ }
++
++// yw 补丁：实验用，见 chiaki_session_yw_set_launchspec_override 的说明
++CHIAKI_EXPORT void chiaki_session_yw_set_launchspec_override(ChiakiSession *session, uint32_t mtu, uint32_t rtt_ms)
++{
++	session->yw_ls_mtu = mtu;
++	session->yw_ls_rtt_ms = rtt_ms;
++}
+diff --git a/lib/src/streamconnection.c b/lib/src/streamconnection.c
+index e26bdd1..9ab2518 100644
+--- a/lib/src/streamconnection.c
++++ b/lib/src/streamconnection.c
+@@ -1001,6 +1001,14 @@ static ChiakiErrorCode stream_connection_send_big(ChiakiStreamConnection *stream
+ 	launch_spec.target = session->target;
+ 	launch_spec.mtu = session->mtu_in;
+ 	launch_spec.rtt = session->rtt_us / 1000;
++	// yw 补丁：实验用，可覆盖 LaunchSpec 的 mtu / rtt
++	if(session->yw_ls_mtu)
++		launch_spec.mtu = session->yw_ls_mtu;
++	if(session->yw_ls_rtt_ms)
++		launch_spec.rtt = session->yw_ls_rtt_ms;
++	CHIAKI_LOGI(session->log, "[yw-ls] LaunchSpec mtu=%u rtt=%u ms（Senkusha 实测 mtu_in=%u mtu_out=%u rtt=%llu us）",
++		(unsigned int)launch_spec.mtu, (unsigned int)launch_spec.rtt,
++		(unsigned int)session->mtu_in, (unsigned int)session->mtu_out, (unsigned long long)session->rtt_us);
+ 	launch_spec.handshake_key = session->handshake_key;
+ 
+ 	launch_spec.width = session->connect_info.video_profile.width;

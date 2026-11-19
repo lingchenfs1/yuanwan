@@ -1,0 +1,62 @@
+# 编译产物
+/build/
+/target/
+# 第三方依赖的源码包、编译中间文件、静态库、Python 环境（由 tools/build-deps-macos.sh 生成）
+/third_party/deps/
+# chiaki-ng 是 v1.10.1 的浅克隆（tools/fetch-chiaki.sh 拉取）；我们的改动以补丁形式保存在 third_party/patches/
+/third_party/chiaki-ng/
+
+# ---- 隐私：下面这些一律不进仓库 ----
+
+# 环境相关的文档只留在本地（含内网地址、账号、设备信息、实验记录）。
+# docs/ 用白名单：只公开协议规格 ywp.md 和调研 research/，其余（PLAN、PROGRESS、network、实验、计划、草稿、评审）都不进仓库。
+/CLAUDE.md
+/CLAUDE.local.md
+/.claude/
+/docs/*
+!/docs/protocol/
+!/docs/research/
+/docs/protocol/*
+!/docs/protocol/ywp.md
+
+# PS5 凭据、其它客户端导出的配置（含 PSN 令牌和远程游玩凭据）
+*.cred
+*.cred.tmp
+PlayStationSettings*.json
+# 开发机脚本的本地配置（网关机登录、密钥路径、PS5 地址），模板见 tools/local.env.example
+/tools/local.env
+local.env
+local.env.*
+!/tools/local.env.example
+.env
+.env.*
+# 私钥和证书
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.pem
+*.key
+*.p12
+
+# 实验日志、码流、录像、截图、抓包、链路轨迹（可能含内网地址、PSN 在线 ID、画面）
+*.log
+*.jsonl
+*.out
+*.tmp
+*.h264
+*.h265
+*.hevc
+*.mp4
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.pcap
+*.pcapng
+*.csv
+*.csv.gz
+
+# 编辑器和系统文件
+.DS_Store
+*.swp
+*~

@@ -1,0 +1,9 @@
+[package]
+name = "yw-gateway"
+description = "家庭网关：PS5 会话端点（M1 原型）"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+yw-chiaki-sys = { path = "../yw-chiaki-sys" }
