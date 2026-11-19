@@ -2,6 +2,9 @@
 //! 按 aseq 存进 64 个槽；目标水位竞技 20 / 均衡 30 / 稳定 50 ms；缺帧或源头丢失做 PLC，
 //! 连续 PLC 超过 5 帧渐弱到静音；水位超过目标 + 60 ms 丢帧；PI 控制变速比 ±0.5%。
 
+// 骨架（M2b 实现时去掉）：函数体还是 todo!()，参数和私有字段暂时用不上
+#![allow(unused_variables, dead_code, clippy::new_without_default)]
+
 use bytes::Bytes;
 use smallvec::SmallVec;
 use ywp::time::Micros;

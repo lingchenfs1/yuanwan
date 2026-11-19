@@ -7,10 +7,6 @@
 //!
 //! RS 只在这里用；ywp 只认 FEC 字的位布局。
 
-// 第 0 步骨架，各组实现时去掉：函数体还是 todo!()，参数和私有字段暂时用不上；
-// 输出参数 `&mut Vec` 还没 push，clippy 会误报 ptr_arg。
-#![allow(unused_variables, dead_code, clippy::new_without_default, clippy::ptr_arg)]
-
 pub mod audio_rx;
 pub mod fec;
 pub mod nal;
