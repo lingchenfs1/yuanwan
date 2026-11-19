@@ -1,8 +1,10 @@
-//! REPORT（0x40）、UP_REPORT（0x44）、NACK（0x41）、NEED（0x42），规格 §5.5.6、§5.5.7、§5.5.9、§5.5.10，
-//! 附录 A.7。所有计数都是累计值，丢掉任何一个 REPORT 都不影响网关算差值。
+//! REPORT（0x40）、UP_REPORT（0x44）、NACK（0x41）、NEED（0x42），规格 §5.5.6、§5.5.7、§5.5.9、§5.5.10。
+//! 所有计数都是累计值，丢掉任何一个 REPORT 都不影响网关算差值。
 
-use super::{EncodeChunk, Writer};
-use crate::consts::{chunk_len, chunk_ty};
+use super::{EncodeChunk, Reader, Writer};
+use crate::consts::{
+    chunk_len, chunk_ty, NACK_MAX_SEGS, NEED_FLAG_KEY, NEED_TRIES_MASK, REPORT_MODE_SHIFT, REPORT_PATHS_MASK,
+};
 use crate::error::{DropReason, WireError};
 
 /// REPORT 偏移 2~19 的视频部分（客户端 Assembler::report 产出，ClientConn::set_video_report 填进 REPORT）。
@@ -48,11 +50,41 @@ pub struct PathReport {
     pub c_est: u16,
 }
 
+impl PathReport {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+        Ok(Self {
+            path_id: r.u8()?,
+            largest_pn: r.u32()?,
+            recv_cnt: r.u32()?,
+            lost_cnt: r.u32()?,
+            lost_short: r.u16()?,
+            burst_max: r.u8()?,
+            q_now: r.u8()?,
+            q_p95: r.u8()?,
+            rx_rate: r.u16()?,
+            c_est: r.u16()?,
+        })
+    }
+
+    fn encode(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
+        w.put_u8(self.path_id)?;
+        w.put_u32(self.largest_pn)?;
+        w.put_u32(self.recv_cnt)?;
+        w.put_u32(self.lost_cnt)?;
+        w.put_u16(self.lost_short)?;
+        w.put_u8(self.burst_max)?;
+        w.put_u8(self.q_now)?;
+        w.put_u8(self.q_p95)?;
+        w.put_u16(self.rx_rate)?;
+        w.put_u16(self.c_est)
+    }
+}
+
 /// REPORT 块的只读视图（GwEvent::Report 和 VideoTx::on_report 共用）
 #[derive(Clone, Copy, Debug)]
 pub struct Report<'a> {
     pub rep_seq: u16,
-    /// 路径数 1~4（偏移 2 的低 3 位）
+    /// 路径数（偏移 2 的低 3 位；规格定义 1~4，解析时不强求，只按它算长度）
     pub n_paths: u8,
     /// 偏移 2~19 的视频部分（mode 取偏移 2 的高 2 位）
     pub video: ReportVideoFields,
@@ -74,7 +106,13 @@ impl Iterator for PathReports<'_> {
     type Item = PathReport;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        if self.rest.len() < chunk_len::REPORT_PATH {
+            self.rest = &[];
+            return None;
+        }
+        let (one, rest) = self.rest.split_at(chunk_len::REPORT_PATH);
+        self.rest = rest;
+        PathReport::decode(&mut Reader::new(one)).ok()
     }
 }
 
@@ -102,6 +140,10 @@ impl<'a> UpReport<'a> {
     pub fn paths(&self) -> UpPathReports<'a> {
         UpPathReports { rest: self.raw }
     }
+
+    pub fn n_paths(&self) -> usize {
+        self.n as usize
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -113,7 +155,20 @@ impl Iterator for UpPathReports<'_> {
     type Item = UpPathReport;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        if self.rest.len() < chunk_len::UP_REPORT_PATH {
+            self.rest = &[];
+            return None;
+        }
+        let (one, rest) = self.rest.split_at(chunk_len::UP_REPORT_PATH);
+        self.rest = rest;
+        let mut r = Reader::new(one);
+        Some(UpPathReport {
+            path_id: r.u8().ok()?,
+            in_recv: r.u32().ok()?,
+            in_lost: r.u32().ok()?,
+            q_up: r.u8().ok()?,
+            up_loss_ppm: r.u16().ok()?,
+        })
     }
 }
 
@@ -131,6 +186,10 @@ impl<'a> Nack<'a> {
     pub fn segments(&self) -> NackSegments<'a> {
         NackSegments { rest: self.raw }
     }
+
+    pub fn n_segments(&self) -> usize {
+        self.n as usize
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -142,7 +201,13 @@ impl Iterator for NackSegments<'_> {
     type Item = (u32, u8);
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        if self.rest.len() < chunk_len::NACK_SEG {
+            self.rest = &[];
+            return None;
+        }
+        let (s, rest) = self.rest.split_at(chunk_len::NACK_SEG);
+        self.rest = rest;
+        Some((u32::from_be_bytes([s[0], s[1], s[2], s[3]]), s[4]))
     }
 }
 
@@ -166,7 +231,7 @@ pub struct Need {
     pub tries: u8,
 }
 
-/// 发送端组好的 REPORT（ClientConn 每 50 ms 组一份）
+/// 发送端组好的 REPORT（ClientConn 定时组一份）
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReportOwned {
     pub rep_seq: u16,
@@ -184,28 +249,81 @@ pub struct UpReportOwned {
 impl<'a> Report<'a> {
     /// 解析 REPORT 块的内容（REPORT_FIXED + REPORT_PATH × 路径数）
     pub fn parse(content: &'a [u8]) -> Result<Self, DropReason> {
-        todo!()
+        if content.len() < chunk_len::REPORT_FIXED {
+            return Err(DropReason::ShortChunk);
+        }
+        let mut r = Reader::new(content);
+        let e = |_| DropReason::ShortChunk;
+        let rep_seq = r.u16().map_err(e)?;
+        let b2 = r.u8().map_err(e)?;
+        let n_paths = b2 & REPORT_PATHS_MASK;
+        let video = ReportVideoFields {
+            mode: b2 >> REPORT_MODE_SHIFT,
+            sb90_ms: r.u8().map_err(e)?,
+            j_ms: r.u8().map_err(e)?,
+            frames_ok: r.u16().map_err(e)?,
+            frames_late: r.u16().map_err(e)?,
+            frames_repair: r.u16().map_err(e)?,
+            frames_lost: r.u16().map_err(e)?,
+            fec_recovered: r.u16().map_err(e)?,
+            oldest_needed_fid: r.u16().map_err(e)?,
+            blocked_fid: r.u16().map_err(e)?,
+            blocked_need: r.u8().map_err(e)?,
+        };
+        let raw_paths = r.bytes(chunk_len::REPORT_PATH * n_paths as usize).map_err(e)?;
+        Ok(Self { rep_seq, n_paths, video, raw_paths })
     }
 }
 
 impl<'a> UpReport<'a> {
     /// 解析 UP_REPORT 块的内容（UP_REPORT_HDR + UP_REPORT_PATH × n）
     pub fn parse(content: &'a [u8]) -> Result<Self, DropReason> {
-        todo!()
+        let (&n, rest) = content.split_first().ok_or(DropReason::ShortChunk)?;
+        let need = chunk_len::UP_REPORT_PATH * n as usize;
+        if rest.len() < need {
+            return Err(DropReason::ShortChunk);
+        }
+        Ok(Self { n, raw: &rest[..need] })
     }
 }
 
 impl<'a> Nack<'a> {
-    /// 解析 NACK 块的内容（NACK_HDR + NACK_SEG × n，n = 1~16）
+    /// 解析 NACK 块的内容（NACK_HDR + NACK_SEG × n，n = 1~16，每段 count ≥ 1）
     pub fn parse(content: &'a [u8]) -> Result<Self, DropReason> {
-        todo!()
+        if content.len() < chunk_len::NACK_HDR {
+            return Err(DropReason::ShortChunk);
+        }
+        let path_id = content[0];
+        let n = content[1];
+        if n == 0 || n as usize > NACK_MAX_SEGS {
+            return Err(DropReason::NackBadSegments);
+        }
+        let need = chunk_len::NACK_SEG * n as usize;
+        let rest = &content[chunk_len::NACK_HDR..];
+        if rest.len() < need {
+            return Err(DropReason::ShortChunk);
+        }
+        let raw = &rest[..need];
+        if raw.as_chunks::<{ chunk_len::NACK_SEG }>().0.iter().any(|s| s[4] == 0) {
+            return Err(DropReason::NackBadSegments);
+        }
+        Ok(Self { path_id, n, raw })
     }
 }
 
 impl Need {
     /// 解析 NEED 块的内容（4 B）
     pub fn parse(content: &[u8]) -> Result<Self, DropReason> {
-        todo!()
+        if content.len() < chunk_len::NEED {
+            return Err(DropReason::ShortChunk);
+        }
+        let flags = content[3];
+        Ok(Self {
+            fid: u16::from_be_bytes([content[0], content[1]]),
+            need: content[2],
+            key: flags & NEED_FLAG_KEY != 0,
+            tries: flags & NEED_TRIES_MASK,
+        })
     }
 }
 
@@ -217,7 +335,26 @@ impl EncodeChunk for ReportOwned {
         chunk_len::REPORT_FIXED + chunk_len::REPORT_PATH * self.paths.len()
     }
     fn encode(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
-        todo!()
+        if self.paths.len() > REPORT_PATHS_MASK as usize {
+            return Err(WireError::Malformed("REPORT 路径数超过 7"));
+        }
+        let v = &self.video;
+        w.put_u16(self.rep_seq)?;
+        w.put_u8((v.mode << REPORT_MODE_SHIFT) | self.paths.len() as u8)?;
+        w.put_u8(v.sb90_ms)?;
+        w.put_u8(v.j_ms)?;
+        w.put_u16(v.frames_ok)?;
+        w.put_u16(v.frames_late)?;
+        w.put_u16(v.frames_repair)?;
+        w.put_u16(v.frames_lost)?;
+        w.put_u16(v.fec_recovered)?;
+        w.put_u16(v.oldest_needed_fid)?;
+        w.put_u16(v.blocked_fid)?;
+        w.put_u8(v.blocked_need)?;
+        for p in &self.paths {
+            p.encode(w)?;
+        }
+        Ok(())
     }
 }
 
@@ -229,7 +366,16 @@ impl EncodeChunk for UpReportOwned {
         chunk_len::UP_REPORT_HDR + chunk_len::UP_REPORT_PATH * self.paths.len()
     }
     fn encode(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
-        todo!()
+        let n = u8::try_from(self.paths.len()).map_err(|_| WireError::Malformed("UP_REPORT 路径数超过 255"))?;
+        w.put_u8(n)?;
+        for p in &self.paths {
+            w.put_u8(p.path_id)?;
+            w.put_u32(p.in_recv)?;
+            w.put_u32(p.in_lost)?;
+            w.put_u8(p.q_up)?;
+            w.put_u16(p.up_loss_ppm)?;
+        }
+        Ok(())
     }
 }
 
@@ -241,7 +387,19 @@ impl EncodeChunk for NackOwned {
         chunk_len::NACK_HDR + chunk_len::NACK_SEG * self.segs.len()
     }
     fn encode(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
-        todo!()
+        if self.segs.is_empty() || self.segs.len() > NACK_MAX_SEGS {
+            return Err(WireError::Malformed("NACK 段数不在 1~16"));
+        }
+        if self.segs.iter().any(|s| s.1 == 0) {
+            return Err(WireError::Malformed("NACK 段的 count 为 0"));
+        }
+        w.put_u8(self.path_id)?;
+        w.put_u8(self.segs.len() as u8)?;
+        for &(start, count) in &self.segs {
+            w.put_u32(start)?;
+            w.put_u8(count)?;
+        }
+        Ok(())
     }
 }
 
@@ -253,6 +411,8 @@ impl EncodeChunk for Need {
         chunk_len::NEED
     }
     fn encode(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
-        todo!()
+        w.put_u16(self.fid)?;
+        w.put_u8(self.need)?;
+        w.put_u8(if self.key { NEED_FLAG_KEY } else { 0 } | (self.tries & NEED_TRIES_MASK))
     }
 }

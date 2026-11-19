@@ -1,7 +1,7 @@
 //! PING / PONG / PATH_CHALLENGE / PATH_RESPONSE / CLOSE（规格 §5.5.8）。
 //! PING = ping_id u16；PATH_* = 8 B 随机数原样回显；CLOSE = code u16 | 原因（UTF-8 ≤ 64 B）。
 
-use super::{EncodeChunk, Writer};
+use super::{EncodeChunk, Reader, Writer};
 use crate::consts::{chunk_len, chunk_ty};
 use crate::error::{DropReason, WireError};
 
@@ -55,7 +55,7 @@ impl EncodeChunk for Ping {
         chunk_len::PING
     }
     fn encode(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
-        todo!()
+        w.put_u16(self.0)
     }
 }
 
@@ -67,7 +67,9 @@ impl EncodeChunk for Pong {
         chunk_len::PONG
     }
     fn encode(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
-        todo!()
+        w.put_u16(self.ping_id)?;
+        w.put_u32(self.echo_ts)?;
+        w.put_u16(self.hold_10us)
     }
 }
 
@@ -79,7 +81,7 @@ impl EncodeChunk for PathChallenge {
         chunk_len::PATH_CHALLENGE
     }
     fn encode(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
-        todo!()
+        w.put_slice(&self.0)
     }
 }
 
@@ -91,7 +93,7 @@ impl EncodeChunk for PathResponse {
         chunk_len::PATH_RESPONSE
     }
     fn encode(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
-        todo!()
+        w.put_slice(&self.0)
     }
 }
 
@@ -103,11 +105,39 @@ impl EncodeChunk for CloseOwned {
         chunk_len::CLOSE_MIN + close_reason_bytes(&self.reason).len()
     }
     fn encode(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
-        todo!()
+        w.put_u16(self.code)?;
+        w.put_slice(close_reason_bytes(&self.reason))
     }
+}
+
+/// 解析 PING 的内容（2 B；更长只读前 2 B）
+pub fn parse_ping(content: &[u8]) -> Result<u16, DropReason> {
+    Reader::new(content).u16().map_err(|_| DropReason::ShortChunk)
 }
 
 /// 解析 PONG 的内容（8 B）
 pub fn parse_pong(content: &[u8]) -> Result<Pong, DropReason> {
-    todo!()
+    if content.len() < chunk_len::PONG {
+        return Err(DropReason::ShortChunk);
+    }
+    let mut r = Reader::new(content);
+    let ping_id = r.u16().map_err(|_| DropReason::ShortChunk)?;
+    let echo_ts = r.u32().map_err(|_| DropReason::ShortChunk)?;
+    let hold_10us = r.u16().map_err(|_| DropReason::ShortChunk)?;
+    Ok(Pong { ping_id, echo_ts, hold_10us })
+}
+
+/// 解析 PATH_CHALLENGE / PATH_RESPONSE 的内容（8 B）
+pub fn parse_path8(content: &[u8]) -> Result<[u8; 8], DropReason> {
+    Reader::new(content).array::<8>().map_err(|_| DropReason::ShortChunk)
+}
+
+/// 解析 CLOSE 的内容：(code, 原因)。原因超过 CLOSE_REASON_MAX 只取前面的部分；
+/// 原因按字节交出，不保证是合法 UTF-8（显示时用 from_utf8_lossy）
+pub fn parse_close(content: &[u8]) -> Result<(u16, &[u8]), DropReason> {
+    let mut r = Reader::new(content);
+    let code = r.u16().map_err(|_| DropReason::ShortChunk)?;
+    let reason = r.rest();
+    let reason = &reason[..reason.len().min(chunk_len::CLOSE_REASON_MAX)];
+    Ok((code, reason))
 }
