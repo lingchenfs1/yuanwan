@@ -8,16 +8,14 @@ pub mod idr;
 pub mod ingress;
 pub mod source;
 
-// 还是第 0 步骨架的模块（函数体是 todo!()，参数和私有字段暂时用不上），实现时去掉这里的 allow：
-// server 在 M2a 第二轮（等 endpoint 和 VideoTx），input、feedback 在 M2b
+pub mod server;
+// 还是第 0 步骨架的模块（函数体是 todo!()，参数和私有字段暂时用不上），M2b 实现时去掉这里的 allow
 #[allow(unused_variables, dead_code, clippy::new_without_default)]
 pub mod feedback;
 #[allow(unused_variables, dead_code, clippy::new_without_default)]
 pub mod input;
-#[allow(unused_variables, dead_code)]
-pub mod server;
 
 pub use idr::{IdrDecision, IdrGovernor, IdrReason};
 pub use ingress::{Ingress, IngressOut, RecoveredPolicy, StreamInfo, VideoIn, WaitWhy};
-pub use server::{spawn, JsonlSink, ServeConfig, ServeHandle};
-pub use source::{AudioHeader, CtlRequest, FbEvent, MediaMsg, PsControl, ServeEvent};
+pub use server::{spawn, spawn_with, ClientStatus, JsonlSink, ServeConfig, ServeCounters, ServeHandle, ServeOptions, ServeStatus};
+pub use source::{AudioHeader, CtlRequest, DetachWhy, FbEvent, MediaMsg, PsControl, ServeEvent};

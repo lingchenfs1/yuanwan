@@ -18,6 +18,7 @@ use crate::idr::IdrReason;
 use ywp::consts::{video_codec, FEC_K_MAX, MAX_SYMBOL_DATA};
 use ywp::msg::{VideoConfig, VideoProfile};
 use ywp::time::{Micros, INGRESS_NO_FRAME};
+use yw_media::nal::{self, Codec};
 use yw_media::video_tx::FrameIn;
 
 /// 为什么进 WaitKey
@@ -117,12 +118,6 @@ enum Gate {
     Waiting(WaitWhy),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Codec {
-    Avc,
-    Hevc,
-}
-
 #[derive(Debug)]
 pub struct Ingress {
     policy: RecoveredPolicy,
@@ -194,7 +189,7 @@ impl Ingress {
             }
             self.cfg_ver = self.cfg_ver.wrapping_add(1);
         }
-        if let Some(c) = detect_codec(data) {
+        if let Some(c) = nal::guess_codec(data) {
             self.detected = Some(c);
         }
         let (codec, fps, width, height) = match self.stream {
@@ -236,12 +231,12 @@ impl Ingress {
             return;
         }
         let codec = self.codec();
-        if is_param_sets_only(data, codec) {
+        if nal::is_param_sets_only(data, codec) {
             // 网关的回调会把参数集写进最新值槽，不走这里；录像回放之类的来源可能直接混在帧里
             self.on_params(data, out);
             return;
         }
-        let key = is_keyframe(data, codec);
+        let key = nal::is_keyframe(data, codec);
         if data.len().div_ceil(MAX_SYMBOL_DATA) > FEC_K_MAX as usize {
             // 会话库以为这一帧已经交付，后面的帧可能引用它
             self.stats.dropped_too_large += 1;
@@ -397,79 +392,10 @@ impl Ingress {
     }
 }
 
-// ---- NAL 判断 ----
-// TODO(C 组 yw_media::nal 落地后)：改用 yw_media::nal::{is_keyframe, is_param_sets_only}，删掉这一段
-
-/// 遍历 Annex-B 里每个 NAL 头的第一个字节（起始码 00 00 01 之后；4 字节起始码同样能匹配）
-fn nal_headers(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
-    let mut i = 0usize;
-    std::iter::from_fn(move || {
-        while i + 3 < data.len() {
-            if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-                let b = data[i + 3];
-                i += 3;
-                return Some(b);
-            }
-            i += 1;
-        }
-        None
-    })
-}
-
-fn nal_type(b: u8, c: Codec) -> u8 {
-    match c {
-        Codec::Hevc => (b >> 1) & 0x3f,
-        Codec::Avc => b & 0x1f,
-    }
-}
-
-fn is_vcl(t: u8, c: Codec) -> bool {
-    match c {
-        Codec::Hevc => t <= 31,
-        Codec::Avc => (1..=5).contains(&t),
-    }
-}
-
-/// 以第一个 VCL NAL 为准：HEVC 是 16~21（IRAP），H.264 是 5（规格 §7.1）
-fn is_keyframe(data: &[u8], c: Codec) -> bool {
-    match nal_headers(data).map(|b| nal_type(b, c)).find(|&t| is_vcl(t, c)) {
-        Some(t) => match c {
-            Codec::Hevc => (16..=21).contains(&t),
-            Codec::Avc => t == 5,
-        },
-        None => false,
-    }
-}
-
-/// 只含参数集（HEVC 的 VPS/SPS/PPS，H.264 的 SPS/PPS），没有 slice
-fn is_param_sets_only(data: &[u8], c: Codec) -> bool {
-    let mut params = false;
-    for t in nal_headers(data).map(|b| nal_type(b, c)) {
-        if is_vcl(t, c) {
-            return false;
-        }
-        if matches!((c, t), (Codec::Hevc, 32..=34) | (Codec::Avc, 7 | 8)) {
-            params = true;
-        }
-    }
-    params
-}
-
-/// 从参数集的第一个 NAL 判断编码
-fn detect_codec(data: &[u8]) -> Option<Codec> {
-    let b = nal_headers(data).next()?;
-    if (32..=34).contains(&nal_type(b, Codec::Hevc)) {
-        Some(Codec::Hevc)
-    } else if matches!(nal_type(b, Codec::Avc), 7 | 8) {
-        Some(Codec::Avc)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yw_media::nal::{guess_codec as detect_codec, is_keyframe, is_param_sets_only};
     use ywp::time::ms;
 
     // HEVC NAL 头第一个字节 = type << 1

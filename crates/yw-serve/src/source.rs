@@ -100,6 +100,8 @@ pub enum DetachWhy {
     Kicked,
     /// 配对被删除
     Unpaired,
+    /// 网关进程退出（发了 CLOSE(5)）
+    GatewayExit,
 }
 
 /// 服务循环 → 网关的监督线程（M2d）
