@@ -1,13 +1,22 @@
 //! 两端的端点状态机（B 组）：握手、加密、PN、CONTROL、调度都在这里汇合。
 //! 调用方喂数据报和 now，取要发的包（poll_transmit）和下一次超时（next_timeout）。
-
+//!
+//! 驱动方式（两端一样，sans-IO，不读墙钟）：
+//! - 收到数据报：`handle_datagram(now, from, pkt, sink)`；
+//! - 到了 `next_timeout()`：`handle_timeout(now, sink)`；
+//! - 上面两件事之后，以及调用方往里塞了东西（控制消息、视频符号……）之后，
+//!   反复 `poll_transmit` 直到返回 None，把每个包发给 `Transmit::dst`。
 //!
 //! 本文件另有两端共用、不依赖线上编码的两块逻辑：
 //! - [`HsSchedule`]：客户端握手的发送节奏（规格 §4.8）；
 //! - [`AttemptRing`]：同一 CID 最近 5 次握手尝试的状态，5 s 过期（规格 §4.3，两端一致）。
 
+// lib.rs 为第 0 步骨架整体放宽了这几项；本模块已实现完，重新打开
+#![warn(unused_variables, dead_code, clippy::new_without_default, clippy::ptr_arg)]
+
 pub mod client;
 pub mod gateway;
+mod session;
 
 pub use client::{ClientConfig, ClientConn, ClientEvent};
 pub use gateway::{GatewayConfig, Gateway, GwConn, GwEvent, Liveness, TakeoverPolicy};
@@ -110,6 +119,13 @@ impl<T> AttemptRing<T> {
     pub fn get(&self, attempt: u32, now: Micros) -> Option<&T> {
         self.items
             .iter()
+            .find(|(a, t, _)| *a == attempt && now.saturating_sub(*t) < HS_ATTEMPT_TTL)
+            .map(|(_, _, s)| s)
+    }
+
+    pub fn get_mut(&mut self, attempt: u32, now: Micros) -> Option<&mut T> {
+        self.items
+            .iter_mut()
             .find(|(a, t, _)| *a == attempt && now.saturating_sub(*t) < HS_ATTEMPT_TTL)
             .map(|(_, _, s)| s)
     }
