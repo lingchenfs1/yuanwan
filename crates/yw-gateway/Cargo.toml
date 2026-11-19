@@ -7,3 +7,6 @@ version.workspace = true
 
 [dependencies]
 yw-chiaki-sys = { path = "../yw-chiaki-sys" }
+ywp = { workspace = true, features = ["net"] }
+yw-serve.workspace = true
+yw-media.workspace = true

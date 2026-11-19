@@ -11,9 +11,8 @@ mod control;
 mod cred;
 mod discovery;
 mod handler;
-// TODO(协调人给 yw-gateway 加上 ywp、yw-serve 依赖后)：打开下一行（hub.rs 已按 yw_serve::PsControl 写好），
-// M2a 第二轮由 serve_glue 和 supervisor 接上
-// mod hub;
+// hub.rs 按 yw_serve::PsControl 写好；M2a 第二轮由 serve_glue 和 supervisor 接上
+mod hub;
 mod jlog;
 mod pairing;
 mod supervisor;

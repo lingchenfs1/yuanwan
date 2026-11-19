@@ -44,8 +44,3 @@ pub mod testkit;
 pub use error::{DropCounters, DropReason, WireError};
 pub use time::Micros;
 
-// 第 0 步骨架：依赖一次写全，还没用上的先占位（免得 cargo 报 unused_dependencies），各组用上后删掉
-use hkdf as _;
-use snow as _;
-#[cfg(feature = "net")]
-use socket2 as _;

@@ -1020,6 +1020,9 @@ name = "yw-gateway"
 version = "0.1.0"
 dependencies = [
  "yw-chiaki-sys",
+ "yw-media",
+ "yw-serve",
+ "ywp",
 ]
 
 [[package]]
