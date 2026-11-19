@@ -11,6 +11,8 @@ use std::fs::OpenOptions;
 use std::io::{IsTerminal, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use ywp::creds::{self, ClientId, KeyError};
+use ywp::crypto::{gateway_id, Secret32, StaticKeypair};
 
 /// 配对串写到哪里
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,34 +32,62 @@ pub(crate) trait KeyStore {
     fn has_keys(&self, dir: &Path) -> Result<bool, String>;
     /// 生成网关静态密钥和 reset_key；rotate_reset 时只换 reset_key（已有的静态密钥和配对不动）
     fn generate(&self, dir: &Path, rotate_reset: bool) -> Result<(), String>;
-    /// 新增一个客户端（PSK 由实现生成），返回配对串
-    fn add_client(&self, dir: &Path, name: &str, client_pub: &[u8; 32]) -> Result<String, String>;
+    /// 新增一个客户端（PSK 由实现生成），返回配对串（entry：写进配对串的入口提示「地址:端口」）
+    fn add_client(&self, dir: &Path, name: &str, client_pub: &[u8; 32], entry: Option<&str>) -> Result<String, String>;
     fn list_clients(&self, dir: &Path) -> Result<Vec<ClientRow>, String>;
     /// 返回是否删掉了
     fn remove_client(&self, dir: &Path, name: &str) -> Result<bool, String>;
 }
 
-/// 正式实现：keys/ 的格式和写入接口由 ywp::creds 定。
-/// TODO(A 组 creds 的写入接口落地、yw-gateway 加上 ywp 依赖后)：改成调用 ywp::creds
+/// 正式实现：keys/ 的格式、加载和写入都走 ywp::creds
 struct CredsStore;
 
-const CREDS_NOT_READY: &str = "keys/ 的读写接口（ywp::creds）还没落地，配对子命令暂时不能用";
+fn kerr(e: KeyError) -> String {
+    e.to_string()
+}
+
+/// keys/ 里网关静态密钥对应的公钥
+pub(crate) fn gateway_pub(dir: &Path) -> Result<[u8; 32], String> {
+    creds::check_dir_perms(dir).map_err(kerr)?;
+    let sk = creds::read_key_file(&dir.join(creds::GATEWAY_KEY_FILE)).map_err(kerr)?;
+    Ok(StaticKeypair::from_secret(*sk.expose()).public())
+}
 
 impl KeyStore for CredsStore {
-    fn has_keys(&self, _dir: &Path) -> Result<bool, String> {
-        Err(CREDS_NOT_READY.into())
+    fn has_keys(&self, dir: &Path) -> Result<bool, String> {
+        Ok(dir.join(creds::GATEWAY_KEY_FILE).exists())
     }
-    fn generate(&self, _dir: &Path, _rotate_reset: bool) -> Result<(), String> {
-        Err(CREDS_NOT_READY.into())
+
+    fn generate(&self, dir: &Path, rotate_reset: bool) -> Result<(), String> {
+        if !rotate_reset {
+            return creds::init_keys(dir).map(|_| ()).map_err(kerr);
+        }
+        // 只换 reset_key：先写成新文件（600），再改名替换，中途失败不留半个文件
+        creds::check_dir_perms(dir).map_err(kerr)?;
+        let tmp = dir.join(format!("{}.new", creds::RESET_KEY_FILE));
+        // 上次中断留下的临时文件（本程序自己写的）
+        let _ = std::fs::remove_file(&tmp);
+        creds::write_key_file(&tmp, &Secret32::random(), "yw 网关 reset_key（算 RESET 令牌），不要外传").map_err(kerr)?;
+        std::fs::rename(&tmp, dir.join(creds::RESET_KEY_FILE)).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("换不了 reset_key：{e}")
+        })
     }
-    fn add_client(&self, _dir: &Path, _name: &str, _client_pub: &[u8; 32]) -> Result<String, String> {
-        Err(CREDS_NOT_READY.into())
+
+    fn add_client(&self, dir: &Path, name: &str, client_pub: &[u8; 32], entry: Option<&str>) -> Result<String, String> {
+        // 先确认网关密钥可读，免得加了配对却编不出配对串
+        let gw = gateway_pub(dir)?;
+        let psk = creds::add_client(dir, name, client_pub).map_err(kerr)?;
+        Ok(creds::encode_pairing(&gw, &psk, entry))
     }
-    fn list_clients(&self, _dir: &Path) -> Result<Vec<ClientRow>, String> {
-        Err(CREDS_NOT_READY.into())
+
+    fn list_clients(&self, dir: &Path) -> Result<Vec<ClientRow>, String> {
+        let list = creds::load_clients(dir).map_err(kerr)?;
+        Ok(list.into_iter().map(|c| (c.name, c.public, ClientId::of(&c.public).0)).collect())
     }
-    fn remove_client(&self, _dir: &Path, _name: &str) -> Result<bool, String> {
-        Err(CREDS_NOT_READY.into())
+
+    fn remove_client(&self, dir: &Path, name: &str) -> Result<bool, String> {
+        creds::remove_client(dir, name).map(|r| r.is_some()).map_err(kerr)
     }
 }
 
@@ -65,9 +95,9 @@ pub fn keygen(dir: &Path, rotate_reset: bool) -> Result<(), String> {
     keygen_with(&CredsStore, dir, rotate_reset)
 }
 
-/// 配对串含 PSK，不进日志，也不显示在终端（见模块说明）
-pub fn pair_add(dir: &Path, name: &str, client_pub: &[u8; 32], out: PairOut) -> Result<(), String> {
-    pair_add_with(&CredsStore, dir, name, client_pub, &out, std::io::stdout().is_terminal())
+/// 配对串含 PSK，不进日志，也不显示在终端（见模块说明）。entry：写进配对串的入口提示（可选）
+pub fn pair_add(dir: &Path, name: &str, client_pub: &[u8; 32], out: PairOut, entry: Option<&str>) -> Result<(), String> {
+    pair_add_with(&CredsStore, dir, name, client_pub, &out, entry, std::io::stdout().is_terminal())
 }
 
 pub fn pair_list(dir: &Path) -> Result<Vec<(String, [u8; 4])>, String> {
@@ -99,6 +129,7 @@ pub(crate) fn pair_add_with(
     name: &str,
     client_pub: &[u8; 32],
     out: &PairOut,
+    entry: Option<&str>,
     stdout_is_tty: bool,
 ) -> Result<(), String> {
     check_name(name)?;
@@ -120,8 +151,10 @@ pub(crate) fn pair_add_with(
     if let Some((n, _, _)) = existing.iter().find(|(_, p, _)| p == client_pub) {
         return Err(format!("这个公钥已经配对过（名字「{n}」）"));
     }
-    let s = store.add_client(dir, name, client_pub)?;
-    if let Err(e) = write_pairing(out, &s) {
+    let s = store.add_client(dir, name, client_pub, entry)?;
+    let r = write_pairing(out, &s);
+    wipe(s);
+    if let Err(e) = r {
         // 配对串没交出去，这条配对没人能用：撤掉
         let _ = store.remove_client(dir, name);
         return Err(format!("{e}（已撤销这次配对）"));
@@ -191,18 +224,24 @@ fn write_pairing(out: &PairOut, s: &str) -> Result<(), String> {
     }
 }
 
-/// 64 位十六进制 → 32 字节公钥
-/// TODO(和 A、E 组对齐)：客户端 keygen 打印公钥的格式定下来后，这里同步（现在只认十六进制）
+/// 用完的配对串（含 PSK）抹成 0 再释放
+fn wipe(s: String) {
+    let mut b = s.into_bytes();
+    b.fill(0);
+    std::hint::black_box(&b);
+}
+
+/// 64 位十六进制（大小写都行）→ 32 字节公钥。和客户端 `yw-client pubkey` 打印的格式一致
 fn parse_pub_hex(s: &str) -> Result<[u8; 32], String> {
-    let s = s.trim();
-    if s.len() != 64 || !s.is_ascii() {
-        return Err("客户端公钥要 64 位十六进制".into());
+    creds::parse_hex32(s.trim()).ok_or_else(|| "客户端公钥要 64 位十六进制".to_string())
+}
+
+/// 入口提示：「地址:端口」，不含空白，最长 255 字节（配对串里的上限）
+fn check_entry(s: &str) -> Result<(), String> {
+    if s.is_empty() || s.len() > 255 || s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("--entry 要「地址:端口」，不含空白，最长 255 字节".into());
     }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|_| "客户端公钥要 64 位十六进制".to_string())?;
-    }
-    Ok(out)
+    Ok(())
 }
 
 fn hex4(fp: &[u8; 4]) -> String {
@@ -212,15 +251,16 @@ fn hex4(fp: &[u8; 4]) -> String {
 pub const USAGE: &str = "配对子命令（keys/ 在 <目录>/keys，<目录> 默认 ~/yw-gw）：
   yw-gateway keygen [--dir <目录>] [--rotate-reset]
       生成网关静态密钥和 reset_key；已有密钥时拒绝（换静态密钥会让所有配对失效）。--rotate-reset 只换 reset_key
-  yw-gateway pair add <名字> <客户端公钥（64 位十六进制）> [--out <文件> | --stdout] [--dir <目录>]
-      配对串含 PSK：默认写成 600 权限的 <目录>/pair-<名字>.txt；--stdout 只在 stdout 不是终端时可用（接管道）
+  yw-gateway pair add <名字> <客户端公钥（64 位十六进制）> [--entry <地址:端口>] [--out <文件> | --stdout] [--dir <目录>]
+      配对串含 PSK：默认写成 600 权限的 <目录>/pair-<名字>.txt；--stdout 只在 stdout 不是终端时可用（接管道）。
+      --entry 写进配对串，客户端导入时当默认入口
   yw-gateway pair list [--dir <目录>]
   yw-gateway pair remove <名字> [--dir <目录>]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Cmd {
     Keygen { rotate_reset: bool },
-    Add { name: String, client_pub: [u8; 32], out: PairOut },
+    Add { name: String, client_pub: [u8; 32], out: PairOut, entry: Option<String> },
     List,
     Remove { name: String },
 }
@@ -230,6 +270,7 @@ fn parse(args: &[String], default_dir: &Path) -> Result<(PathBuf, Cmd), String> 
     let mut dir = default_dir.to_path_buf();
     let mut out: Option<PairOut> = None;
     let mut rotate_reset = false;
+    let mut entry: Option<String> = None;
     let mut pos: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -253,6 +294,12 @@ fn parse(args: &[String], default_dir: &Path) -> Result<(PathBuf, Cmd), String> 
                 }
                 out = Some(PairOut::Stdout);
             }
+            "--entry" => {
+                let v = val()?;
+                check_entry(v)?;
+                entry = Some(v.clone());
+                i += 1;
+            }
             "--rotate-reset" => rotate_reset = true,
             _ if a.starts_with("--") => return Err(format!("不认识的参数：{a}")),
             _ => pos.push(a),
@@ -263,6 +310,9 @@ fn parse(args: &[String], default_dir: &Path) -> Result<(PathBuf, Cmd), String> 
     if !matches!(pos.as_slice(), ["keygen"] | ["pair", "add", ..]) && (out.is_some() || rotate_reset) {
         return Err("这个子命令不接受 --out、--stdout、--rotate-reset".into());
     }
+    if !matches!(pos.as_slice(), ["pair", "add", ..]) && entry.is_some() {
+        return Err("只有 pair add 接受 --entry".into());
+    }
     let cmd = match pos.as_slice() {
         ["keygen"] => {
             only("keygen 的 --out/--stdout", out.is_none())?;
@@ -272,7 +322,7 @@ fn parse(args: &[String], default_dir: &Path) -> Result<(PathBuf, Cmd), String> 
             only("pair add 的 --rotate-reset", !rotate_reset)?;
             check_name(name)?;
             let out = out.unwrap_or_else(|| PairOut::File(dir.join(format!("pair-{name}.txt"))));
-            Cmd::Add { name: name.to_string(), client_pub: parse_pub_hex(key)?, out }
+            Cmd::Add { name: name.to_string(), client_pub: parse_pub_hex(key)?, out, entry }
         }
         ["pair", "list"] => Cmd::List,
         ["pair", "remove", name] => Cmd::Remove { name: name.to_string() },
@@ -296,15 +346,17 @@ pub fn run(args: &[String], default_dir: &Path) -> i32 {
             if rotate_reset {
                 "已换 reset_key（之前发给客户端的 RESET 令牌全部失效）".to_string()
             } else {
-                format!("已生成网关密钥：{}", keys.display())
+                // 指纹是公钥的摘要，不是秘密：给客户端导入后核对用
+                let fp = gateway_pub(&keys).map(|p| creds::to_hex(&gateway_id(&p))).unwrap_or_else(|e| format!("读不出：{e}"));
+                format!("已生成网关密钥：{}，网关指纹 {fp}", keys.display())
             }
         }),
-        Cmd::Add { name, client_pub, out } => {
+        Cmd::Add { name, client_pub, out, entry } => {
             let shown = match &out {
                 PairOut::File(p) => format!("配对串已写入 {}（600 权限）。导入客户端后请把这个文件移到废纸篓", p.display()),
                 PairOut::Stdout => String::new(),
             };
-            pair_add(&keys, &name, &client_pub, out).map(|_| {
+            pair_add(&keys, &name, &client_pub, out, entry.as_deref()).map(|_| {
                 if shown.is_empty() {
                     eprintln!("已配对「{name}」");
                 }
@@ -358,9 +410,9 @@ mod tests {
             }
             Ok(())
         }
-        fn add_client(&self, _dir: &Path, name: &str, client_pub: &[u8; 32]) -> Result<String, String> {
+        fn add_client(&self, _dir: &Path, name: &str, client_pub: &[u8; 32], entry: Option<&str>) -> Result<String, String> {
             self.clients.borrow_mut().push((name.to_string(), *client_pub));
-            Ok(format!("PAIRING-FOR-{name}"))
+            Ok(format!("PAIRING-FOR-{name}{}", entry.map(|e| format!("@{e}")).unwrap_or_default()))
         }
         fn list_clients(&self, _dir: &Path) -> Result<Vec<ClientRow>, String> {
             Ok(self.clients.borrow().iter().map(|(n, p)| (n.clone(), *p, [p[0], p[1], p[2], p[3]])).collect())
@@ -403,8 +455,9 @@ mod tests {
         assert_eq!(parse(&args("keygen"), d).unwrap(), (d.to_path_buf(), Cmd::Keygen { rotate_reset: false }));
         assert_eq!(parse(&args("keygen --rotate-reset --dir /x"), d).unwrap(), (PathBuf::from("/x"), Cmd::Keygen { rotate_reset: true }));
         let (_, c) = parse(&args(&format!("pair add 客厅 {PUB}")), d).unwrap();
-        let Cmd::Add { name, client_pub, out } = c else { panic!() };
+        let Cmd::Add { name, client_pub, out, entry } = c else { panic!() };
         assert_eq!(name, "客厅");
+        assert_eq!(entry, None);
         assert_eq!(client_pub[0], 1);
         assert_eq!(client_pub[31], 0x20);
         assert_eq!(out, PairOut::File(PathBuf::from("/base/pair-客厅.txt")));
@@ -423,6 +476,10 @@ mod tests {
         assert!(parse(&args("pair"), d).is_err());
         assert!(parse(&args("keygen --dir"), d).is_err());
         assert!(parse(&args("keygen --force"), d).is_err());
+        let (_, c) = parse(&args(&format!("pair add a {} --entry 192.0.2.10:9420", PUB.to_uppercase())), d).unwrap();
+        assert!(matches!(c, Cmd::Add { entry: Some(e), client_pub, .. } if e == "192.0.2.10:9420" && client_pub[31] == 0x20));
+        assert!(parse(&args("pair list --entry 192.0.2.10:9420"), d).is_err());
+        assert!(parse(&args(&format!("pair add a {PUB} --entry")), d).is_err());
         assert!(parse(&args(&format!("pair add {} {PUB}", "长".repeat(11))), d).is_err(), "33 字节");
     }
 
@@ -453,24 +510,24 @@ mod tests {
         let s = MemStore::default();
         let pk = parse_pub_hex(PUB).unwrap();
         let f = t.0.join("pair-a.txt");
-        pair_add_with(&s, &t.0, "a", &pk, &PairOut::File(f.clone()), true).unwrap();
+        pair_add_with(&s, &t.0, "a", &pk, &PairOut::File(f.clone()), None, true).unwrap();
         let m = std::fs::metadata(&f).unwrap();
         assert_eq!(m.permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "PAIRING-FOR-a\n");
         // 重名、重复公钥、目标文件已存在
         let f2 = t.0.join("pair-b.txt");
-        assert!(pair_add_with(&s, &t.0, "a", &[9; 32], &PairOut::File(f2.clone()), true).unwrap_err().contains("已经有"));
-        assert!(pair_add_with(&s, &t.0, "b", &pk, &PairOut::File(f2.clone()), true).unwrap_err().contains("配对过"));
-        assert!(pair_add_with(&s, &t.0, "b", &[9; 32], &PairOut::File(f.clone()), true).unwrap_err().contains("已存在"));
+        assert!(pair_add_with(&s, &t.0, "a", &[9; 32], &PairOut::File(f2.clone()), None, true).unwrap_err().contains("已经有"));
+        assert!(pair_add_with(&s, &t.0, "b", &pk, &PairOut::File(f2.clone()), None, true).unwrap_err().contains("配对过"));
+        assert!(pair_add_with(&s, &t.0, "b", &[9; 32], &PairOut::File(f.clone()), None, true).unwrap_err().contains("已存在"));
         assert!(!f2.exists());
-        assert!(pair_add_with(&s, &t.0, "b", &[0; 32], &PairOut::File(f2.clone()), true).is_err());
+        assert!(pair_add_with(&s, &t.0, "b", &[0; 32], &PairOut::File(f2.clone()), None, true).is_err());
         assert_eq!(s.clients.borrow().len(), 1);
     }
 
     #[test]
     fn pair_add_stdout_refuses_terminal() {
         let s = MemStore::default();
-        let e = pair_add_with(&s, Path::new("/nonexistent"), "a", &[7; 32], &PairOut::Stdout, true).unwrap_err();
+        let e = pair_add_with(&s, Path::new("/nonexistent"), "a", &[7; 32], &PairOut::Stdout, None, true).unwrap_err();
         assert!(e.contains("终端"));
         assert!(s.clients.borrow().is_empty(), "拒绝时不加客户端");
     }
@@ -481,7 +538,7 @@ mod tests {
         let s = MemStore::default();
         // 目录不存在，文件建不了
         let f = t.0.join("no-such-dir").join("p.txt");
-        let e = pair_add_with(&s, &t.0, "a", &[7; 32], &PairOut::File(f), true).unwrap_err();
+        let e = pair_add_with(&s, &t.0, "a", &[7; 32], &PairOut::File(f), None, true).unwrap_err();
         assert!(e.contains("撤销"), "{e}");
         assert!(s.clients.borrow().is_empty());
     }
@@ -490,8 +547,8 @@ mod tests {
     fn remove_and_list() {
         let t = TmpDir::new("remove");
         let s = MemStore::default();
-        pair_add_with(&s, &t.0, "a", &[7; 32], &PairOut::File(t.0.join("1")), true).unwrap();
-        pair_add_with(&s, &t.0, "b", &[8; 32], &PairOut::File(t.0.join("2")), true).unwrap();
+        pair_add_with(&s, &t.0, "a", &[7; 32], &PairOut::File(t.0.join("1")), Some("192.0.2.10:9420"), true).unwrap();
+        pair_add_with(&s, &t.0, "b", &[8; 32], &PairOut::File(t.0.join("2")), None, true).unwrap();
         assert!(pair_remove_with(&s, &t.0, "c").is_err());
         pair_remove_with(&s, &t.0, "a").unwrap();
         let l = s.list_clients(&t.0).unwrap();
@@ -501,8 +558,45 @@ mod tests {
     }
 
     #[test]
-    fn real_store_not_ready_yet() {
-        // creds 写入接口落地前，子命令明确报错而不是 panic
-        assert!(pair_list(Path::new("/nonexistent")).unwrap_err().contains("ywp::creds"));
+    fn remove_and_list_entry_goes_into_pairing() {
+        let t = TmpDir::new("entry");
+        let s = MemStore::default();
+        let f = t.0.join("p.txt");
+        pair_add_with(&s, &t.0, "a", &[7; 32], &PairOut::File(f.clone()), Some("192.0.2.10:9420"), true).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "PAIRING-FOR-a@192.0.2.10:9420\n");
+    }
+
+    #[test]
+    fn real_store_keygen_pair_list_remove() {
+        let t = TmpDir::new("real");
+        let keys = t.0.join("keys");
+        // 还没有 keys/：list 报错而不是 panic
+        assert!(pair_list(&keys).is_err());
+        keygen(&keys, false).unwrap();
+        assert!(keygen(&keys, false).is_err(), "已有密钥不覆盖");
+        let gw_file = keys.join(creds::GATEWAY_KEY_FILE);
+        let reset_file = keys.join(creds::RESET_KEY_FILE);
+        let (gw0, reset0) = (std::fs::read(&gw_file).unwrap(), std::fs::read(&reset_file).unwrap());
+        keygen(&keys, true).unwrap();
+        assert_eq!(std::fs::read(&gw_file).unwrap(), gw0, "--rotate-reset 不动静态密钥");
+        assert_ne!(std::fs::read(&reset_file).unwrap(), reset0);
+        assert_eq!(std::fs::metadata(&reset_file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!keys.join("reset.key.new").exists());
+
+        let out = t.0.join("pair-a.txt");
+        let client = [7u8; 32];
+        pair_add(&keys, "a", &client, PairOut::File(out.clone()), Some("192.0.2.10:9420")).unwrap();
+        assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o600);
+        let info = creds::decode_pairing(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(info.gw_pub, gateway_pub(&keys).unwrap());
+        assert_eq!(info.entry_hint.as_deref(), Some("192.0.2.10:9420"));
+        let loaded = creds::load_keys(&keys).unwrap();
+        assert_eq!(loaded.clients.len(), 1);
+        assert_eq!(loaded.clients[0].psk.expose(), info.psk.expose(), "配对串里的 PSK 就是 keys/ 里那份");
+        assert!(pair_add(&keys, "b", &client, PairOut::File(t.0.join("pair-b.txt")), None).unwrap_err().contains("配对过"));
+        assert_eq!(pair_list(&keys).unwrap(), vec![("a".to_string(), ClientId::of(&client).0)]);
+        pair_remove(&keys, "a").unwrap();
+        assert!(pair_list(&keys).unwrap().is_empty());
+        assert!(pair_remove(&keys, "a").is_err());
     }
 }

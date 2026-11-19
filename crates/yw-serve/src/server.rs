@@ -591,8 +591,9 @@ impl<S: DgramSock> Server<S> {
     // ------------------------------------------------------------------
 
     fn process_events(&mut self, now: Micros, from_timeout: bool) {
-        let evs = std::mem::take(&mut self.evs);
-        for e in evs {
+        // 拿出来处理（处理过程中不会再调端点的 handle_*，不会有新事件进来），处理完把缓冲放回去复用
+        let mut evs = std::mem::take(&mut self.evs);
+        for e in evs.drain(..) {
             match e {
                 Ev::Connected { client, cid, init_name } => self.attach(now, client, cid, init_name),
                 Ev::Replaced => {}
@@ -609,6 +610,9 @@ impl<S: DgramSock> Server<S> {
                 }
                 Ev::PathChanged(a) => self.log.log('I', "ywp", &format!("客户端地址变了：{a}")),
             }
+        }
+        if self.evs.is_empty() {
+            self.evs = evs;
         }
         // 端点自己删掉的会话（kick、配对被删……）在这里补上
         self.sync_presence(now, DetachWhy::Kicked);

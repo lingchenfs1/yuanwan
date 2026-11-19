@@ -1,22 +1,25 @@
-//! 会话回调：统计、参数集缓存、截屏和录像，以及 chiaki 日志的过滤。
-//! 回调都在 chiaki 的线程上执行，所以只做计数和少量文件写入。
+//! 会话回调：统计、参数集缓存、截屏和录像，chiaki 日志的过滤，以及把视频交给 YWP 服务循环。
+//! 回调都在 chiaki 的线程上执行，所以只做计数、拷贝和少量文件写入：
+//! - 视频帧拷贝一份经 ServeHandle::push（try_send + wake）交给 ywp 线程，带递增的 seq；队列满了不阻塞；
+//! - 参数集、音频头写进 Hub 按 epoch 的最新值槽（只拿那一把短锁），再发一条通知；
+//! - 关键帧到达时写 Hub.last_key_us（原子量，不拿 PsLink 的锁）；
+//! - 有客户端时 push 失败返回 false（chiaki 不把这一帧记作参考，下一帧开始时向 PS5 报 CORRUPTFRAME）；
+//!   丢的是关键帧还要置标志，让 Ingress 进 WaitKey(Overflow)。没有客户端时总是返回 true，行为和 M1 一样。
 
+use crate::hub::Hub;
 use crate::jlog::Logger;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 use yw_chiaki_sys::{log_level, Event, Handler, QuitInfo};
+use yw_media::nal::{self, Codec};
+use yw_serve::{AudioHeader, MediaMsg, ServeHandle};
 
-static T0: OnceLock<Instant> = OnceLock::new();
-
-/// 进程启动以来的单调时钟微秒数。
-pub fn now_us() -> u64 {
-    T0.get_or_init(Instant::now).elapsed().as_micros() as u64
-}
+/// 进程内的单调时钟微秒数。和 yw-serve 的服务循环、IdrGovernor 用同一个时钟（yw_serve::clock）
+pub use yw_serve::clock::now_us;
 
 /// 写盘线程的缓冲上限（帧）。15 Mbps 下约 2 s、几 MB；满了说明磁盘跟不上，就中断录制。
 const REC_QUEUE_FRAMES: usize = 120;
@@ -169,6 +172,12 @@ pub struct Shared {
     pub header: Mutex<Vec<u8>>,
     pub recorder: Mutex<Option<Recorder>>,
     pub log: Arc<Logger>,
+    /// 本会话的 epoch（监督线程 install 之后、start 之前写）
+    pub epoch: AtomicU32,
+    /// MediaMsg::Video 的递增序号（每个视频回调加 1，push 失败也加，服务循环据此看出跳号）
+    pub video_seq: AtomicU32,
+    /// 有客户端时 push 失败的次数（回调返回了 false）
+    pub media_full: AtomicU64,
 }
 
 impl Shared {
@@ -197,6 +206,9 @@ impl Shared {
             header: Mutex::new(Vec::new()),
             recorder: Mutex::new(None),
             log,
+            epoch: AtomicU32::new(0),
+            video_seq: AtomicU32::new(0),
+            media_full: AtomicU64::new(0),
         }
     }
 
@@ -209,49 +221,21 @@ impl Shared {
     }
 }
 
-/// 遍历 Annex-B 里每个 NAL 的类型。
-fn nal_types(data: &[u8], hevc: bool) -> impl Iterator<Item = u8> + '_ {
-    let mut i = 0usize;
-    std::iter::from_fn(move || {
-        while i + 3 < data.len() {
-            if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-                let b = data[i + 3];
-                i += 3;
-                return Some(if hevc { (b >> 1) & 0x3f } else { b & 0x1f });
-            }
-            i += 1;
-        }
-        None
-    })
-}
-
-fn is_slice(t: u8, hevc: bool) -> bool {
-    if hevc {
-        t <= 31
-    } else {
-        (1..=5).contains(&t)
-    }
-}
-
-fn is_keyframe(data: &[u8], hevc: bool) -> bool {
-    nal_types(data, hevc).any(|t| if hevc { (16..=21).contains(&t) } else { t == 5 })
-}
-
-fn is_param_sets_only(data: &[u8], hevc: bool) -> bool {
-    let mut params = false;
-    for t in nal_types(data, hevc) {
-        if is_slice(t, hevc) {
-            return false;
-        }
-        if (hevc && (32..=34).contains(&t)) || (!hevc && (t == 7 || t == 8)) {
-            params = true;
-        }
-    }
-    params
-}
-
 pub struct GwHandler {
     pub s: Arc<Shared>,
+    pub hub: Arc<Hub>,
+    /// None：YWP 没启动（keys/ 有问题或没配对客户端），行为和 M1 一样
+    pub serve: Option<Arc<ServeHandle>>,
+}
+
+impl GwHandler {
+    fn codec(&self) -> Codec {
+        if self.s.hevc {
+            Codec::Hevc
+        } else {
+            Codec::Avc
+        }
+    }
 }
 
 impl Handler for GwHandler {
@@ -341,14 +325,21 @@ impl Handler for GwHandler {
         }
     }
 
-    /// M2a 第一轮：照常总是收下（返回 true），行为和 M1 一样。接上 yw-serve 之后改成 ServeHandle::push 的结果
+    /// 返回 false 表示没收下（只在有客户端、而 MediaMsg 队列满时）
     fn on_video(&self, data: &[u8], frames_lost: i32, recovered: bool) -> bool {
         let s = &self.s;
-        if is_param_sets_only(data, s.hevc) {
+        let codec = self.codec();
+        let epoch = s.epoch.load(Relaxed);
+        if nal::is_param_sets_only(data, codec) {
             *s.header.lock().unwrap_or_else(|e| e.into_inner()) = data.to_vec();
+            self.hub.set_params(epoch, data);
+            if let Some(sv) = &self.serve {
+                // 只是通知：丢了也不要紧，服务循环会从最新值槽补取
+                sv.push(MediaMsg::ParamsChanged { epoch });
+            }
             return true;
         }
-        let key = is_keyframe(data, s.hevc);
+        let key = nal::is_keyframe(data, codec);
         let t = now_us();
         s.frames.fetch_add(1, Relaxed);
         s.bytes.fetch_add(data.len() as u64, Relaxed);
@@ -356,6 +347,7 @@ impl Handler for GwHandler {
         if key {
             s.keyframes.fetch_add(1, Relaxed);
             s.last_keyframe_us.store(t, Relaxed);
+            self.hub.note_keyframe(t);
         }
         if frames_lost > 0 {
             s.frames_lost.fetch_add(frames_lost as i64, Relaxed);
@@ -374,7 +366,19 @@ impl Handler for GwHandler {
                 }
             }
         }
-        true
+        drop(rec);
+        let Some(sv) = &self.serve else { return true };
+        let seq = s.video_seq.fetch_add(1, Relaxed).wrapping_add(1);
+        let msg = MediaMsg::Video { seq, epoch, data: data.to_vec(), frames_lost, recovered, rx_us: t };
+        if sv.push(msg) || !sv.client_present() {
+            // 没有客户端时队列满了也照常返回 true：不影响 PS5 会话（M1 行为）
+            return true;
+        }
+        s.media_full.fetch_add(1, Relaxed);
+        if key {
+            sv.note_key_overflow();
+        }
+        false
     }
 
     fn on_audio(&self, _data: &[u8]) {
@@ -387,5 +391,10 @@ impl Handler for GwHandler {
 
     fn on_audio_header(&self, channels: u32, bits: u32, rate: u32, frame_size: u32) {
         self.s.log.info("audio", &format!("声道 {channels}，位深 {bits}，采样率 {rate}，帧长 {frame_size}"));
+        let epoch = self.s.epoch.load(Relaxed);
+        self.hub.set_audio_header(epoch, AudioHeader { channels, bits, rate, frame_size });
+        if let Some(sv) = &self.serve {
+            sv.push(MediaMsg::AudioHeaderChanged { epoch });
+        }
     }
 }

@@ -1,7 +1,8 @@
-//! yw-gateway：家庭网关（M1 原型）。
+//! yw-gateway：家庭网关。
 //!
 //! 在局域网里长期持有 PS5 的 Remote Play 会话：唤醒、建会话、看门狗、退避重试；
-//! 没有客户端时一直发中性输入保持会话。YWP（对远端客户端的协议）在 M2 加入。
+//! 没有客户端时一直发中性输入保持会话。M2a 起经 YWP（yw-serve）把画面转发给远端客户端；
+//! keys/ 有问题或没有配对客户端时不起 YWP，行为和 M1 一样。
 //!
 //! 用法见 `yw-gateway --help`。在 macOS 上要装成 LaunchDaemon 运行（见 deploy/macos/），
 //! 用户级 LaunchAgent 会被本地网络隐私拦截，连不上 PS5。
@@ -11,10 +12,10 @@ mod control;
 mod cred;
 mod discovery;
 mod handler;
-// hub.rs 按 yw_serve::PsControl 写好；M2a 第二轮由 serve_glue 和 supervisor 接上
 mod hub;
 mod jlog;
 mod pairing;
+mod serve_glue;
 mod supervisor;
 
 use config::{Cli, GatewayConf, HoldAction};
@@ -175,10 +176,14 @@ fn main() {
     yw_chiaki_sys::install_signal_handlers();
 
     let (tx, rx) = mpsc::channel();
-    if let Err(e) = control::spawn(dir.join("control.sock"), tx, log.clone()) {
+    // YWP：keys/ 不对或没有配对客户端时不起，PS5 会话照常（serve_glue 里记日志）
+    let hub = Arc::new(hub::Hub::new(hub::random_boot_id()));
+    let glue = serve_glue::start(&conf, &dir, hub.clone(), log.clone());
+    let route = control::YwpRoute { serve: glue.serve.clone(), why_not: glue.why_not.clone() };
+    if let Err(e) = control::spawn(dir.join("control.sock"), tx, route, log.clone()) {
         log.error("control", &format!("控制口启动失败：{e}"));
     }
-    Supervisor::new(cfg, cred, log).run(rx);
+    Supervisor::new(cfg, cred, log, hub, glue).run(rx);
     let _ = std::fs::remove_file(dir.join("control.sock"));
     drop(lock);
 }

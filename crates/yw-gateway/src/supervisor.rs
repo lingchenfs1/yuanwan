@@ -6,18 +6,31 @@
 //!
 //! 暂停是持久的（--dir 下的 paused 文件）：pause、sleep、PS5 主动结束串流、登录 PIN 有问题都会进入暂停，
 //! 网关重启后仍保持暂停，直到 resume。这样网关不会和用户在 PS5 上的操作（待机、关机）对着干。
+//!
+//! M2a：
+//! - PS5 会话放进 Hub.link（PsLink）：建会话 `Session::new` → `install` 得到 epoch → 告诉回调 → `start`；
+//!   结束时先 `take()` 取出来，再在锁外 `stop()` 和 drop；
+//! - 看门狗的 IDR 请求走 IdrGovernor（Hub::request_idr）；每拍调 `idr_tick`（1.2 s 重发、5 s 报 Escalate）；
+//! - 状态变化写进 Hub.status，并经 MediaMsg::PsChanged 告诉 ywp 线程（它转成 SESSION_STATUS）；
+//! - 退出时先让 ywp 线程给客户端发 CLOSE(5)（最多等 200 ms），再结束 PS5 会话；
+//! - 没有客户端、或 YWP 没启动时，控制口命令和会话行为都和 M1 一样。
 
 use crate::control::Request;
 use crate::cred::Cred;
 use crate::discovery::{self, HostState};
 use crate::handler::{now_us, GwHandler, Recorder, Shared};
+use crate::hub::{Hub, PsStatus};
 use crate::jlog::{escape, Logger};
+use crate::serve_glue::Glue;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use yw_chiaki_sys::{log_level, Codec, Session, SessionParams};
+use yw_serve::{IdrDecision, IdrReason, MediaMsg, PsControl, ServeEvent, ServeHandle, StreamInfo};
+use ywp::consts::{ps_state, video_codec};
+use ywp::wire::SessionInfo;
 
 pub struct Config {
     pub host: String,
@@ -40,6 +53,8 @@ pub struct Config {
 const WAKE_DEADLINE: Duration = Duration::from_secs(60);
 /// 唤醒后仍在待机时，隔多久重发唤醒包（唤醒包只是一个 UDP 包，Wi-Fi 下会丢）
 const WAKE_RESEND: Duration = Duration::from_secs(10);
+/// 退出时等 ywp 线程发完 CLOSE(5) 的上限（规格附录 B：最多等 200 ms 再结束 PS5 会话）
+const EXIT_CLOSE_WAIT: Duration = Duration::from_millis(200);
 
 enum State {
     /// 查询 PS5 状态
@@ -67,10 +82,27 @@ impl State {
             State::Paused => "暂停",
         }
     }
+
+    /// SESSION_STATUS 的 ps_state（规格 §5.5.5）
+    fn ps_state(&self) -> u8 {
+        match self {
+            State::Probe => ps_state::IDLE,
+            State::WaitReady { .. } => ps_state::WAKING,
+            State::Connecting { .. } => ps_state::CONNECTING,
+            State::Streaming { .. } => ps_state::STREAMING,
+            State::Backoff { .. } => ps_state::BACKOFF,
+            State::Paused => ps_state::PAUSED,
+        }
+    }
 }
 
+/// 建会话的分辨率档位 → 宽度（PS5 的四档都是 16:9）
+fn width_of(height: u32) -> u16 {
+    (height * 16 / 9).min(u16::MAX as u32) as u16
+}
+
+/// 当前会话的网关侧状态；会话本身在 Hub.link 里
 struct Live {
-    session: Session,
     shared: Arc<Shared>,
     started: Instant,
     id: u64,
@@ -103,10 +135,18 @@ pub struct Supervisor {
     started_at: Instant,
     last_stats: Instant,
     prev: Snap,
+    hub: Arc<Hub>,
+    serve: Option<Arc<ServeHandle>>,
+    serve_events: Receiver<ServeEvent>,
+    ywp_why_not: String,
+    host_id: [u8; 8],
+    /// 上一次告诉 ywp 线程的 (ps_state, epoch)
+    published: Option<(u8, u32)>,
 }
 
 impl Supervisor {
-    pub fn new(cfg: Config, cred: Cred, log: Arc<Logger>) -> Supervisor {
+    pub fn new(cfg: Config, cred: Cred, log: Arc<Logger>, hub: Arc<Hub>, glue: Glue) -> Supervisor {
+        let host_id = ywp::crypto::host_id(&cfg.host);
         let mut sup = Supervisor {
             cfg,
             cred,
@@ -124,6 +164,12 @@ impl Supervisor {
             started_at: Instant::now(),
             last_stats: Instant::now(),
             prev: Snap::default(),
+            hub,
+            serve: glue.serve,
+            serve_events: glue.events,
+            ywp_why_not: glue.why_not,
+            host_id,
+            published: None,
         };
         if let Ok(why) = std::fs::read_to_string(sup.pause_marker()) {
             sup.state = State::Paused;
@@ -169,6 +215,12 @@ impl Supervisor {
                 self.exit = true;
             }
             if self.exit {
+                // 先让客户端知道网关要退出（CLOSE(5)，它会按握手节奏重连），再结束 PS5 会话
+                if let Some(sv) = &self.serve {
+                    if !sv.shutdown(EXIT_CLOSE_WAIT) {
+                        self.log.warn("ywp", "YWP 服务 200 ms 内没确认退出");
+                    }
+                }
                 self.stop_session("网关退出");
                 break;
             }
@@ -183,6 +235,9 @@ impl Supervisor {
                 let _ = reply.send(r);
             }
             self.step();
+            self.idr_tick();
+            self.drain_serve_events();
+            self.publish_state();
             self.maybe_stats();
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -226,7 +281,7 @@ impl Supervisor {
                     .unwrap_or(false);
                 if ready {
                     if let Some(l) = &self.live {
-                        l.session.set_controller_idle(); // 没有客户端时一直发中性输入，保持会话
+                        self.hub.link.with(|s| s.set_controller_idle()); // 没有客户端时一直发中性输入，保持会话
                         self.log.info("session", &format!("串流中（发起会话后 {:.2} s 出首帧）", l.started.elapsed().as_secs_f64()));
                     }
                     State::Streaming { since: now, idr_1s: false, idr_3s: false }
@@ -249,13 +304,14 @@ impl Supervisor {
                     self.stop_session("视频停流");
                     return self.state = self.fail("视频停流 8 秒");
                 }
+                // 看门狗的 IDR 请求走 IdrGovernor：每秒 ≤ 1 次、未决合并，1.2 s 重发由 idr_tick 做
                 if gap_ms > 3000 && !idr_3s {
-                    self.log.warn("watchdog", "3 秒没有视频，再次请求 IDR");
-                    let _ = l.session.request_idr();
+                    let d = self.hub.request_idr(now_us(), IdrReason::Watchdog);
+                    self.log.warn("watchdog", &format!("3 秒没有视频，再次请求 IDR（{}）", idr_word(d)));
                     idr_3s = true;
                 } else if gap_ms > 1000 && !idr_1s {
-                    self.log.warn("watchdog", "1 秒没有视频，请求 IDR");
-                    let _ = l.session.request_idr();
+                    let d = self.hub.request_idr(now_us(), IdrReason::Watchdog);
+                    self.log.warn("watchdog", &format!("1 秒没有视频，请求 IDR（{}）", idr_word(d)));
                     idr_1s = true;
                 } else if gap_ms < 500 && (idr_1s || idr_3s) {
                     self.log.info("watchdog", "视频恢复");
@@ -270,7 +326,7 @@ impl Supervisor {
                     if self.hold_since.elapsed() >= hold {
                         let mins = hold.as_secs() / 60;
                         if self.cfg.hold_sleep {
-                            let r = l.session.goto_bed();
+                            let r = self.hub.link.with(|s| s.goto_bed()).unwrap_or_else(|| Err("没有会话".into()));
                             self.log.info("hold", &format!("保持期 {mins} 分钟已到，让 PS5 休眠：{}", r.err().unwrap_or_else(|| "已发送".into())));
                         }
                         self.stop_session("保持期满");
@@ -331,12 +387,29 @@ impl Supervisor {
             console_pin: self.cred.console_pin,
             log_mask: log_level::ERROR | log_level::WARNING | log_level::INFO | log_level::VERBOSE,
         };
-        let session = match Session::new(&params, Arc::new(GwHandler { s: shared.clone() })) {
+        let handler = GwHandler { s: shared.clone(), hub: self.hub.clone(), serve: self.serve.clone() };
+        let session = match Session::new(&params, Arc::new(handler)) {
             Ok(s) => s,
             Err(e) => return self.fail(&format!("创建会话失败：{e}")),
         };
-        if let Err(e) = session.start() {
-            drop(session);
+        // 顺序：install 得到 epoch → 告诉回调和最新值槽 → start（start 之前不会有回调）
+        let epoch = self.hub.link.install(Box::new(session));
+        shared.epoch.store(epoch, Relaxed);
+        let codec = match self.cfg.codec {
+            Codec::H264 => video_codec::AVC,
+            Codec::H265 => video_codec::HEVC,
+            Codec::H265Hdr => video_codec::HEVC_HDR,
+        };
+        let stream = StreamInfo {
+            codec,
+            fps: self.cfg.fps.min(u8::MAX as u32) as u8,
+            width: width_of(self.cfg.height),
+            height: self.cfg.height.min(u16::MAX as u32) as u16,
+        };
+        self.hub.set_stream_info(epoch, stream);
+        if let Some(Err(e)) = self.hub.link.with(|s| s.start()) {
+            // 取出来在锁外释放（Drop 会等 chiaki 的线程退出）
+            drop(self.hub.link.take());
             return self.fail(&format!("启动会话失败：{e}"));
         }
         self.log.info(
@@ -351,16 +424,20 @@ impl Supervisor {
                 self.cfg.loss_max * 100.0
             ),
         );
-        self.live = Some(Live { session, shared, started: Instant::now(), id: self.sessions_started });
+        self.live = Some(Live { shared, started: Instant::now(), id: self.sessions_started });
         State::Connecting { since: Instant::now() }
     }
 
     /// 正常结束当前会话（不 kill：kill 之后 PS5 会返回约 10 s 的 IN_USE）。
     fn stop_session(&mut self, why: &str) {
-        if let Some(mut l) = self.live.take() {
+        if let Some(l) = self.live.take() {
             self.log.info("session", &format!("结束会话：{why}"));
-            l.session.stop();
-            drop(l); // Drop 里 join 并释放，之后不会再有回调
+            // 先 take() 出来，再在锁外 stop()：stop 和 drop 都可能等 chiaki 的线程
+            if let Some(mut s) = self.hub.link.take() {
+                s.stop();
+                drop(s); // Drop 里 join 并释放，之后不会再有回调
+            }
+            drop(l);
         }
     }
 
@@ -377,6 +454,7 @@ impl Supervisor {
         let quit = self.live.as_ref().and_then(|l| l.shared.take_quit());
         if let Some(q) = quit {
             if let Some(l) = self.live.take() {
+                drop(self.hub.link.take());
                 drop(l);
             }
             self.last_quit = q.reason.clone();
@@ -480,8 +558,13 @@ impl Supervisor {
         let not_streaming = || format!("未在串流（当前：{}）", self.state.name());
         match cmd {
             "status" => self.status_json(),
+            // 操作者的明确命令：和 M1 一样直接请求，不经 IdrGovernor
             "idr" => match &self.live {
-                Some(l) if streaming => l.session.request_idr().map(|_| "ok".into()).unwrap_or_else(|e| format!("失败：{e}")),
+                Some(_) if streaming => match self.hub.link.with(|s| s.request_idr()) {
+                    Some(Ok(())) => "ok".into(),
+                    Some(Err(e)) => format!("失败：{e}"),
+                    None => not_streaming(),
+                },
                 _ => not_streaming(),
             },
             "snap" | "record" => {
@@ -499,25 +582,26 @@ impl Supervisor {
                     Err(e) => return format!("失败：{e}"),
                 };
                 let old = l.shared.recorder.lock().unwrap_or_else(|e| e.into_inner()).replace(rec);
-                let _ = l.session.request_idr();
+                let _ = self.hub.link.with(|s| s.request_idr());
                 let note = if old.is_some() { "（已取消上一个录制）" } else { "" };
                 drop(old); // 旧录制的写盘线程会删掉它的临时文件
                 format!("ok{note}：从下一个关键帧开始写入 {}", path.display())
             }
             "inject" => {
-                let Some(l) = &self.live else { return "没有会话".into() };
+                if self.live.is_none() {
+                    return "没有会话".into();
+                }
                 let Some(v) = arg1.and_then(|s| s.parse::<f64>().ok()) else { return "用法：inject <0~1，-1 恢复>".into() };
-                l.session.set_inject_loss(v);
+                self.hub.link.with(|s| s.set_inject_loss(v));
                 self.log.info("control", &format!("注入丢包上报 {v}"));
                 "ok".into()
             }
             "sleep" => {
                 // 休眠命令要经 ctrl 连接发给 PS5，没有会话就发不出去
-                let reply = match &self.live {
-                    Some(l) => match l.session.goto_bed() {
-                        Ok(()) => "ok：已让 PS5 休眠，网关已暂停（resume 恢复）".to_string(),
-                        Err(e) => format!("让 PS5 休眠失败：{e}；网关已暂停（resume 恢复）"),
-                    },
+                let bed = if self.live.is_some() { self.hub.link.with(|s| s.goto_bed()) } else { None };
+                let reply = match bed {
+                    Some(Ok(())) => "ok：已让 PS5 休眠，网关已暂停（resume 恢复）".to_string(),
+                    Some(Err(e)) => format!("让 PS5 休眠失败：{e}；网关已暂停（resume 恢复）"),
                     None => "没有会话，PS5 未休眠；网关已暂停（resume 恢复）".to_string(),
                 };
                 self.log.info("control", &reply);
@@ -553,12 +637,12 @@ impl Supervisor {
                 self.exit = true;
                 "ok：正在退出".into()
             }
-            _ => "不认识的命令。可用：status idr snap record inject sleep pause resume restart quit".into(),
+            _ => "不认识的命令。可用：status idr snap record inject sleep pause resume restart quit clients kick clients-reload".into(),
         }
     }
 
     fn status_json(&self) -> String {
-        let (session_s, frames, keyframes, lost, fec_fail, target, last_frame_ms, fast) = match &self.live {
+        let (session_s, frames, keyframes, lost, fec_fail, target, last_frame_ms, fast, recovered, media_full) = match &self.live {
             Some(l) => {
                 let s = &l.shared;
                 let last = s.last_frame_us.load(Relaxed);
@@ -571,11 +655,14 @@ impl Supervisor {
                     s.target_bitrate.load(Relaxed),
                     if last == 0 { -1 } else { (now_us().saturating_sub(last) / 1000) as i64 },
                     s.fast_resends.load(Relaxed),
+                    s.frames_recovered.load(Relaxed),
+                    s.media_full.load(Relaxed),
                 )
             }
-            None => (0.0, 0, 0, 0, 0, 0, -1, 0),
+            None => (0.0, 0, 0, 0, 0, 0, -1, 0, 0, 0),
         };
-        format!(
+        // M1 的字段原样在前，M2 新增的接在后面
+        let m1 = format!(
             "{{\"state\":\"{}\",\"pause_reason\":\"{}\",\"host\":\"{}\",\"uptime_s\":{:.0},\"session_s\":{:.0},\"sessions\":{},\"failures\":{},\"last_quit\":\"{}\",\"frames\":{},\"keyframes\":{},\"frames_lost\":{},\"fec_failures\":{},\"fast_resends\":{},\"target_bitrate\":{},\"last_frame_ms_ago\":{}}}",
             self.state.name(),
             escape(&self.pause_reason),
@@ -592,6 +679,71 @@ impl Supervisor {
             fast,
             target,
             last_frame_ms
+        );
+        let idr = self.hub.link.idr_stats();
+        let ps = self.hub.status();
+        let ywp = match &self.serve {
+            Some(sv) => sv.status().to_json(),
+            None => format!("{{\"running\":false,\"why\":\"{}\"}}", escape(&self.ywp_why_not)),
+        };
+        format!(
+            "{},\"frames_recovered\":{recovered},\"media_full\":{media_full},\"ps_state\":{},\"state_ms\":{},\"epoch\":{},\"idr\":{{\"sent\":{},\"resent\":{},\"coalesced\":{},\"deferred\":{},\"escalated\":{},\"satisfied\":{},\"errors\":{}}},\"ywp\":{ywp}}}",
+            &m1[..m1.len() - 1],
+            ps.ps_state,
+            now_us().saturating_sub(ps.since_us) / 1000,
+            Some(ps.epoch).filter(|&e| e != 0).map(|e| format!("\"{e:08x}\"")).unwrap_or_else(|| "null".into()),
+            idr.sent,
+            idr.resent,
+            idr.coalesced,
+            idr.deferred,
+            idr.escalated,
+            idr.satisfied,
+            self.hub.link.idr_errors(),
         )
+    }
+
+    // ------------------------------------------------------------ M2a：IdrGovernor、YWP
+
+    /// 每拍调 IdrGovernor::tick：1.2 s 没等到关键帧就重发，5 s 报一次 Escalate（M2d 起转 L7）
+    fn idr_tick(&mut self) {
+        match self.hub.idr_tick(now_us()) {
+            Some(IdrDecision::Requested) => self.log.record("idr_resend", "\"why\":\"1.2 s 没等到关键帧\""),
+            Some(IdrDecision::Escalate) => self.log.warn("idr", "请求 IDR 后 5 秒仍没有关键帧（M2d 起转 L7 重建会话）"),
+            _ => {}
+        }
+    }
+
+    /// ywp 线程的事件（客户端接入、离开已由 ywp 线程记日志；PS5_CMD 等在 M2d 接）
+    fn drain_serve_events(&mut self) {
+        while let Ok(ev) = self.serve_events.try_recv() {
+            if let ServeEvent::Ps5Cmd { cmd, .. } = ev {
+                self.log.info("ywp", &format!("客户端发来 PS5_CMD {cmd:?}（M2d 才处理）"));
+            }
+        }
+    }
+
+    /// 状态或 epoch 变了：写进 Hub.status，并告诉 ywp 线程（它转成 SESSION_STATUS，并填进 HS_RESP）
+    fn publish_state(&mut self) {
+        let cur = (self.state.ps_state(), self.hub.link.epoch().unwrap_or(0));
+        if self.published == Some(cur) {
+            return;
+        }
+        let (ps, epoch) = cur;
+        self.hub.set_status(PsStatus { ps_state: ps, epoch, since_us: now_us(), text: self.state.name().to_string() });
+        let info = SessionInfo { ps_state: ps, host_id: self.host_id, epoch, resumable: false };
+        match &self.serve {
+            // 队列满了下一拍再试
+            Some(sv) if !sv.push(MediaMsg::PsChanged(info)) => {}
+            _ => self.published = Some(cur),
+        }
+    }
+}
+
+fn idr_word(d: IdrDecision) -> &'static str {
+    match d {
+        IdrDecision::Requested => "已请求",
+        IdrDecision::Coalesced => "并入未决的请求",
+        IdrDecision::Deferred => "限频，稍后发",
+        IdrDecision::Escalate => "已超时",
     }
 }

@@ -45,8 +45,8 @@ pub struct Cli {
     pub hold_sleep: bool,
 }
 
-/// YWP 默认端口 UDP 9420（和 ywp::consts::DEFAULT_PORT 一致；yw-gateway 加上 ywp 依赖后改成引用它）
-pub const DEFAULT_YWP_PORT: u16 = 9420;
+/// YWP 默认端口 UDP 9420
+pub const DEFAULT_YWP_PORT: u16 = ywp::consts::DEFAULT_PORT;
 pub const DEFAULT_BITRATE_KBPS: u32 = 15000;
 pub const DEFAULT_LOSS_MAX: f64 = 0.03;
 

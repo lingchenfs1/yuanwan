@@ -4,7 +4,9 @@
 //! - Hub 实现 yw_serve::PsControl，ywp 线程经它调 PS5 会话；
 //! - 参数集、音频头、码流信息按 epoch 存「最新值槽」：chiaki 只在会话开始时交一次参数集和音频头，
 //!   通知（MediaMsg）丢了也能从槽里补取；
-//! - last_key_us：最近一次收到关键帧的时刻，监督线程的 idr_tick 拿它判断 IDR 请求有没有等到。
+//! - last_key_us：最近一次收到关键帧的时刻（chiaki 回调在关键帧到达时写，不拿 PsLink 的锁），
+//!   监督线程的 idr_tick 拿它判断 IDR 请求有没有等到；
+//! - 控制口 status 的 YWP 摘要由 yw-serve 自己维护（ServeHandle::status），不放在这里。
 //!
 //! 锁的规则：
 //! - 锁序固定为 `PsLink.idr → PsLink.session → chiaki 内部锁`，不能反过来；
@@ -12,9 +14,6 @@
 //! - 监督线程结束会话时先 `take()` 把会话取出来，再在锁外 `stop()` 和 drop（drop 会等 chiaki 的线程退出）。
 //!
 //! 建会话的顺序：`Session::new`（还没开始连）→ `install` 得到 epoch → 告诉回调这个 epoch → `start`。
-
-// M2a 第二轮由 serve_glue、supervisor 接上，接上后去掉
-#![allow(dead_code)]
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
@@ -34,6 +33,8 @@ pub trait PsSession: Send {
     fn set_controller_idle(&self);
     fn request_idr(&self) -> Result<(), String>;
     fn goto_bed(&self) -> Result<(), String>;
+    /// 控制口 inject：上报给 PS5 的丢包率（-1 恢复）
+    fn set_inject_loss(&self, loss: f64);
 }
 
 /// YWP 的 STATE（规格 §5.5.3）→ 外壳的手柄状态。按键位表两边相同（0 × … 15 PS），摇杆都是 i16。
@@ -68,6 +69,9 @@ impl PsSession for Session {
     }
     fn goto_bed(&self) -> Result<(), String> {
         Session::goto_bed(self)
+    }
+    fn set_inject_loss(&self, loss: f64) {
+        Session::set_inject_loss(self, loss)
     }
 }
 
@@ -203,7 +207,8 @@ impl LatestSlots {
     }
 }
 
-/// PS5 会话的状态（监督线程写，ywp 线程读后转成 SESSION_STATUS；字段 M2d 再补）
+/// PS5 会话的状态（监督线程写）。M2a 里 ywp 线程经 MediaMsg::PsChanged 拿到状态，这里只给控制口 status 读；
+/// M2d 的 SESSION_STATUS（说明文字、已持续时长、pause_kind）从这里取，字段到时再补
 #[derive(Clone, Debug, Default)]
 pub struct PsStatus {
     /// ywp::consts::ps_state
@@ -211,20 +216,22 @@ pub struct PsStatus {
     pub epoch: u32,
     /// 进入这个状态的时刻
     pub since_us: Micros,
+    /// 说明文字（M2d 填进 SESSION_STATUS 的 TLV 4）
+    #[allow(dead_code)]
     pub text: String,
 }
 
-/// ywp 线程给控制口 status 用的摘要（拼好的 JSON 片段，不含密钥和 PSK）
-#[derive(Clone, Debug, Default)]
-pub struct YwpSnapshot {
-    pub json: String,
+impl Hub {
+    /// 当前状态的拷贝
+    pub fn status(&self) -> PsStatus {
+        lock(&self.status).clone()
+    }
 }
 
 pub struct Hub {
     pub link: PsLink,
     pub status: Mutex<PsStatus>,
     pub status_ver: AtomicU64,
-    pub snapshot: Mutex<YwpSnapshot>,
     pub latest: Mutex<LatestSlots>,
     /// 最近一次收到关键帧的时刻（yw_serve::clock 的时钟），0 表示还没有
     pub last_key_us: AtomicU64,
@@ -236,7 +243,6 @@ impl Hub {
             link: PsLink::new(boot_id),
             status: Mutex::new(PsStatus::default()),
             status_ver: AtomicU64::new(0),
-            snapshot: Mutex::new(YwpSnapshot::default()),
             latest: Mutex::new(LatestSlots::default()),
             last_key_us: AtomicU64::new(0),
         }
@@ -360,6 +366,9 @@ mod tests {
         fn goto_bed(&self) -> Result<(), String> {
             self.log("bed");
             Ok(())
+        }
+        fn set_inject_loss(&self, loss: f64) {
+            self.log(&format!("inject:{loss}"));
         }
     }
 
